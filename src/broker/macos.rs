@@ -54,18 +54,26 @@ const MS_SSO_URL: &str = "https://login.microsoftonline.com/common";
 /// Uses Apple's `ASAuthorizationSingleSignOnProvider` to communicate with the
 /// Microsoft Enterprise SSO plug-in installed via Company Portal.
 ///
-/// All ObjC objects are created on the main thread at request time. Only the
-/// availability flag is cached at construction.
+/// All ObjC objects are created on the main thread at request time. Only
+/// plain Rust data is stored in the struct.
 pub struct MacOsBroker {
     available: bool,
+    redirect_uri: String,
+    authority: String,
 }
 
 impl MacOsBroker {
     /// Create a new macOS SSO broker.
     ///
-    /// Checks whether the Microsoft Enterprise SSO extension is available.
+    /// `redirect_uri` is required by the SSO extension to match the request
+    /// to your Azure app registration. Use the format `msauth.{bundle_id}://auth`
+    /// (or `msauth.com.msauth.unsignedapp://auth` for unsigned executables).
+    ///
+    /// `authority` is the Azure AD authority URL
+    /// (e.g. `https://login.microsoftonline.com/common`).
+    ///
     /// Should be called from the main thread for accurate availability detection.
-    pub fn new() -> Result<Self> {
+    pub fn new(redirect_uri: impl Into<String>, authority: impl Into<String>) -> Result<Self> {
         // Check availability. If not on main thread, conservatively assume available
         // if we can at least parse the URL.
         let available = MainThreadMarker::new().map_or(true, |_mtm| {
@@ -80,7 +88,11 @@ impl MacOsBroker {
                 .unwrap_or(false)
         });
 
-        Ok(Self { available })
+        Ok(Self {
+            available,
+            redirect_uri: redirect_uri.into(),
+            authority: authority.into(),
+        })
     }
 
     /// Execute an SSO request on the main thread, returning the result via oneshot.
@@ -106,6 +118,8 @@ impl MacOsBroker {
 /// Plain-data parameters for an SSO request (Send-safe, no ObjC objects).
 struct SsoRequestParams {
     client_id: String,
+    redirect_uri: String,
+    authority: String,
     scopes: String,
     operation: String,
     interactive: bool,
@@ -138,9 +152,12 @@ fn execute_sso_on_main_thread(
     unsafe { request.setRequestedOperation(&op) };
     unsafe { request.setUserInterfaceEnabled(params.interactive) };
 
-    // Build query items.
+    // Build query items — redirect_uri and authority are required by the
+    // SSO extension to match the request to the Azure app registration.
     let mut kv_pairs: Vec<(&str, &str)> = vec![
         ("client_id", &params.client_id),
+        ("redirect_uri", &params.redirect_uri),
+        ("authority", &params.authority),
         ("scope", &params.scopes),
         ("correlation_id", &params.correlation_id),
         ("msg_protocol_ver", "3"),
@@ -210,6 +227,8 @@ impl NativeBroker for MacOsBroker {
 
             let params = SsoRequestParams {
                 client_id: client_id.to_string(),
+                redirect_uri: self.redirect_uri.clone(),
+                authority: self.authority.clone(),
                 scopes: request.scopes.join(" "),
                 operation: "refresh".to_string(),
                 interactive: false,
@@ -232,6 +251,8 @@ impl NativeBroker for MacOsBroker {
         Box::pin(async move {
             let params = SsoRequestParams {
                 client_id: client_id.to_string(),
+                redirect_uri: self.redirect_uri.clone(),
+                authority: self.authority.clone(),
                 scopes: request.scopes.join(" "),
                 operation: "login".to_string(),
                 interactive: true,

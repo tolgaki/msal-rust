@@ -176,7 +176,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(all(target_os = "macos", feature = "broker-macos"))]
     {
-        let broker = msal::broker::macos::MacOsBroker::new()?;
+        let broker = msal::broker::macos::MacOsBroker::new(
+            "msauth.com.example.myapp://auth",
+            "https://login.microsoftonline.com/your-tenant-id",
+        )?;
         app.set_broker(Box::new(broker)).await;
     }
 
