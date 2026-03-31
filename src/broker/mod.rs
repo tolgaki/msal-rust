@@ -34,6 +34,8 @@
 //! # }
 //! ```
 
+#[cfg(all(target_os = "macos", feature = "broker-macos"))]
+pub mod macos;
 #[cfg(all(target_os = "windows", feature = "broker-wam"))]
 pub mod wam;
 

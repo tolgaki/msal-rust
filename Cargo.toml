@@ -15,6 +15,14 @@ categories = ["authentication", "web-programming"]
 [features]
 default = []
 broker-wam = ["windows"]
+broker-macos = [
+    "objc2",
+    "objc2-foundation",
+    "objc2-authentication-services",
+    "objc2-app-kit",
+    "block2",
+    "dispatch2",
+]
 
 [dependencies]
 base64 = "0.22"
@@ -29,6 +37,33 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSString",
+    "NSURL",
+    "NSArray",
+    "NSURLResponse",
+    "NSDictionary",
+    "NSObject",
+    "NSError",
+    "NSValue",
+] }
+objc2-authentication-services = { version = "0.3", optional = true, features = [
+    "ASAuthorizationSingleSignOnProvider",
+    "ASAuthorizationSingleSignOnRequest",
+    "ASAuthorizationSingleSignOnCredential",
+    "ASAuthorizationController",
+    "ASAuthorization",
+    "ASAuthorizationRequest",
+    "ASAuthorizationCredential",
+    "ASAuthorizationProvider",
+    "ASAuthorizationError",
+] }
+objc2-app-kit = { version = "0.3", optional = true, features = ["NSWindow", "NSResponder"] }
+block2 = { version = "0.6", optional = true }
+dispatch2 = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", optional = true, features = [
