@@ -160,7 +160,7 @@ fn execute_sso_on_main_thread(
         ("authority", &params.authority),
         ("scope", &params.scopes),
         ("correlation_id", &params.correlation_id),
-        ("msg_protocol_ver", "3"),
+        ("msg_protocol_ver", "4"),
         ("provider_type", "provider_aad_v2"),
     ];
     let acct_id_ref;
