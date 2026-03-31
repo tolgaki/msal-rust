@@ -26,16 +26,11 @@
 //!
 //! let app = PublicClientApplication::new(config)?;
 //!
-//! let request = DeviceCodeRequest {
-//!     scopes: vec!["user.read".into()],
-//!     claims: None,
-//!     correlation_id: None,
-//! };
-//!
 //! let result = app
-//!     .acquire_token_by_device_code(request, |info| {
-//!         println!("{}", info.message);
-//!     })
+//!     .acquire_token_by_device_code(
+//!         DeviceCodeRequest::new(vec!["user.read".into()]),
+//!         |info| println!("{}", info.message),
+//!     )
 //!     .await?;
 //!
 //! println!("Access token: {}", result.access_token);
@@ -57,13 +52,11 @@
 //!
 //! let app = ConfidentialClientApplication::new(config)?;
 //!
-//! let request = ClientCredentialRequest {
-//!     scopes: vec!["https://graph.microsoft.com/.default".into()],
-//!     claims: None,
-//!     correlation_id: None,
-//! };
-//!
-//! let result = app.acquire_token_by_client_credential(request).await?;
+//! let result = app
+//!     .acquire_token_by_client_credential(
+//!         ClientCredentialRequest::new(vec!["https://graph.microsoft.com/.default".into()]),
+//!     )
+//!     .await?;
 //! println!("Token: {}", result.access_token);
 //! # Ok(())
 //! # }
@@ -71,18 +64,19 @@
 //!
 //! # Feature Flags
 //!
-//! | Feature | Description |
-//! |---------|-------------|
-//! | `broker-wam` | Windows Web Account Manager broker for device-bound tokens and SSO |
+//! | Feature | Platform | Description |
+//! |---------|----------|-------------|
+//! | `broker-wam` | Windows | Web Account Manager for device-bound tokens and SSO |
+//! | `broker-macos` | macOS | Enterprise SSO plug-in via Company Portal |
 //!
 //! # Modules
 //!
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`client`] | `PublicClientApplication` and `ConfidentialClientApplication` |
-//! | [`broker`] | Native authentication broker trait and WAM implementation |
+//! | [`broker`] | Native broker trait + platform implementations (WAM, macOS SSO) |
 //! | [`config`] | Configuration builder |
-//! | [`request`] | Request parameter types for each authentication flow |
+//! | [`request`] | Request types with `::new()` constructors for each flow |
 //! | [`response`] | [`AuthenticationResult`] returned by all acquire-token methods |
 //! | [`account`] | [`AccountInfo`] and token claims |
 //! | [`authority`] | Authority resolution and OpenID Connect discovery |

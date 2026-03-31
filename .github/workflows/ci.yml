@@ -41,6 +41,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --features broker-wam
 
+  test-macos-broker:
+    name: Test (macOS broker)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --features broker-macos
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

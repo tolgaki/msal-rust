@@ -30,8 +30,11 @@ cargo build
 # With WAM broker support (Windows only)
 cargo build --features broker-wam
 
+# With macOS Enterprise SSO broker support
+cargo build --features broker-macos
+
 # Run all checks
-cargo clippy --all-features
+cargo clippy
 cargo fmt --check
 cargo test
 cargo doc --no-deps

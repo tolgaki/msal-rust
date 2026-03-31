@@ -7,7 +7,7 @@
 
 A Rust implementation of the [Microsoft Authentication Library (MSAL)](https://learn.microsoft.com/en-us/entra/msal/),
 enabling authentication with the Microsoft identity platform (Azure AD, Microsoft
-accounts, Azure AD B2C).
+personal accounts, Azure AD B2C).
 
 This crate is part of the MSAL family of libraries alongside
 [msal-js](https://github.com/AzureAD/microsoft-authentication-library-for-js),
@@ -20,7 +20,7 @@ and [MSAL Go](https://github.com/AzureAD/microsoft-authentication-library-for-go
 
 - **Public client** authentication for desktop apps, CLI tools, and devices
 - **Confidential client** authentication for web apps, daemons, and APIs
-- **Brokered authentication** via Windows WAM for device-bound tokens and SSO
+- **Brokered authentication** via Windows WAM and macOS Enterprise SSO for device-bound tokens and system-wide SSO
 - In-memory **token cache** with automatic expiration handling
 - **Authority discovery** via OpenID Connect metadata
 - Support for Azure AD, Azure AD B2C, ADFS, and CIAM authorities
@@ -37,7 +37,7 @@ and [MSAL Go](https://github.com/AzureAD/microsoft-authentication-library-for-go
 | Refresh Token | Yes | Yes |
 | Silent (cache + refresh) | Yes | Yes |
 | Username/Password (ROPC) | Yes | - |
-| Interactive (WAM broker) | Yes | - |
+| Interactive (native broker) | Yes | - |
 
 ## Installation
 
@@ -49,11 +49,14 @@ msal = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
-For Windows WAM broker support:
+For native broker support:
 
 ```toml
-[dependencies]
+# Windows (Web Account Manager)
 msal = { version = "0.1", features = ["broker-wam"] }
+
+# macOS (Enterprise SSO plug-in)
+msal = { version = "0.1", features = ["broker-macos"] }
 ```
 
 ## Quick Start
@@ -72,16 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = PublicClientApplication::new(config)?;
 
-    let request = DeviceCodeRequest {
-        scopes: vec!["user.read".into()],
-        claims: None,
-        correlation_id: None,
-    };
-
     let result = app
-        .acquire_token_by_device_code(request, |info| {
-            println!("{}", info.message);
-        })
+        .acquire_token_by_device_code(
+            DeviceCodeRequest::new(vec!["user.read".into()]),
+            |info| println!("{}", info.message),
+        )
         .await?;
 
     println!("Signed in, access token: {}...", &result.access_token[..20]);
@@ -104,11 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = ConfidentialClientApplication::new(config)?;
 
-    let request = ClientCredentialRequest {
-        scopes: vec!["https://graph.microsoft.com/.default".into()],
-        claims: None,
-        correlation_id: None,
-    };
+    let request = ClientCredentialRequest::new(
+        vec!["https://graph.microsoft.com/.default".into()],
+    );
 
     let result = app.acquire_token_by_client_credential(request).await?;
     println!("Token: {}...", &result.access_token[..20]);
@@ -120,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust,no_run
 use msal::{Configuration, PublicClientApplication};
-use msal::request::AuthorizationCodeRequest;
+use msal::request::{AuthorizationCodeRequest, SilentFlowRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -130,34 +126,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = PublicClientApplication::new(config)?;
 
-    // Step 1: Generate the authorization URL.
-    let (auth_url, pkce) = app
-        .get_authorization_url(
-            vec!["user.read".into()],
-            "http://localhost:3000/redirect",
-            None,
-        )
-        .await?;
+    // Step 1: Generate the authorization URL (synchronous).
+    let scopes = vec!["user.read".into()];
+    let (auth_url, pkce) = app.authorization_url(
+        &scopes,
+        "http://localhost:3000/redirect",
+        None,
+    )?;
 
     println!("Visit: {auth_url}");
 
     // Step 2: Exchange the authorization code.
-    let request = AuthorizationCodeRequest {
-        code: "code-from-redirect".into(),
-        scopes: vec!["user.read".into()],
-        redirect_uri: "http://localhost:3000/redirect".into(),
-        code_verifier: Some(pkce.verifier),
-        claims: None,
-        correlation_id: None,
-    };
+    let mut request = AuthorizationCodeRequest::new(
+        "code-from-redirect".into(),
+        scopes.clone(),
+        "http://localhost:3000/redirect".into(),
+    );
+    request.code_verifier = Some(pkce.verifier);
 
     let result = app.acquire_token_by_code(request).await?;
     println!("Signed in as: {}", result.account.unwrap().username);
+
+    // Step 3: Silent token renewal (from cache or refresh token).
+    // let silent = SilentFlowRequest::new(scopes, account);
+    // let cached = app.acquire_token_silent(silent).await?;
     Ok(())
 }
 ```
 
-### Brokered Authentication (Windows WAM)
+### Brokered Authentication (Windows / macOS)
 
 ```rust,no_run
 use msal::{Configuration, PublicClientApplication};
@@ -171,9 +168,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = PublicClientApplication::new(config)?;
 
+    // Set up the platform-specific broker.
     #[cfg(all(target_os = "windows", feature = "broker-wam"))]
     {
         let broker = msal::broker::wam::WamBroker::new().await?;
+        app.set_broker(Box::new(broker)).await;
+    }
+    #[cfg(all(target_os = "macos", feature = "broker-macos"))]
+    {
+        let broker = msal::broker::macos::MacOsBroker::new()?;
         app.set_broker(Box::new(broker)).await;
     }
 
@@ -200,8 +203,10 @@ Before using this library, register your application in the
 
 1. Go to **Azure Active Directory** > **App registrations** > **New registration**
 2. Set a name and select supported account types
-3. Set a redirect URI (e.g., `http://localhost:3000/redirect` for web, or
-   `ms-appx-web://Microsoft.AAD.BrokerPlugin/{client_id}` for WAM broker)
+3. Set a redirect URI:
+   - Web apps: `http://localhost:3000/redirect`
+   - WAM broker: `ms-appx-web://Microsoft.AAD.BrokerPlugin/{client_id}`
+   - macOS broker: `msauth.{bundle_id}://auth`
 4. Note your **Application (client) ID** and **Directory (tenant) ID**
 5. For confidential clients: go to **Certificates & secrets** and create a client secret
 
@@ -215,22 +220,23 @@ msal (crate root)
  |    +-- confidential   ConfidentialClientApplication (app flows)
  +-- broker
  |    +-- mod            NativeBroker trait
- |    +-- wam            Windows WAM implementation (feature: broker-wam)
+ |    +-- wam            Windows WAM (feature: broker-wam)
+ |    +-- macos          macOS Enterprise SSO (feature: broker-macos)
  +-- authority       Authority resolution and OpenID discovery
  +-- cache           In-memory token cache
  +-- account         AccountInfo, IdTokenClaims, ClientInfo
  +-- request         Request parameter types for each flow
  +-- response        AuthenticationResult, TokenResponse
  +-- crypto          PKCE, nonce generation, JWT decoding
- +-- network         HTTP client and token endpoint communication
  +-- error           MsalError enum
 ```
 
 ## Feature Flags
 
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `broker-wam` | No | Windows Web Account Manager broker support |
+| Feature | Default | Platform | Description |
+|---------|---------|----------|-------------|
+| `broker-wam` | No | Windows | Web Account Manager for device-bound tokens and SSO |
+| `broker-macos` | No | macOS | Enterprise SSO plug-in via Company Portal |
 
 ## Minimum Supported Rust Version (MSRV)
 
