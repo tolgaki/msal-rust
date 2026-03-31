@@ -10,11 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = ConfidentialClientApplication::new(config)?;
 
-    let request = ClientCredentialRequest {
-        scopes: vec!["https://graph.microsoft.com/.default".into()],
-        claims: None,
-        correlation_id: None,
-    };
+    let request = ClientCredentialRequest::new(vec!["https://graph.microsoft.com/.default".into()]);
 
     let result = app.acquire_token_by_client_credential(request).await?;
 

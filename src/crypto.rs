@@ -28,7 +28,7 @@ pub struct PkceParams {
     /// The code challenge (base64url-encoded SHA-256 of the verifier).
     pub challenge: String,
     /// The challenge method (always `"S256"`).
-    pub challenge_method: String,
+    pub challenge_method: &'static str,
 }
 
 impl PkceParams {
@@ -39,7 +39,7 @@ impl PkceParams {
         PkceParams {
             verifier,
             challenge,
-            challenge_method: "S256".into(),
+            challenge_method: "S256",
         }
     }
 }

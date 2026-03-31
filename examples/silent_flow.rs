@@ -22,13 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let accounts = app.all_accounts().await?;
     let result = if let Some(account) = accounts.first() {
         // Try silent first.
-        let silent_request = SilentFlowRequest {
-            scopes: scopes.clone(),
-            account: account.clone(),
-            force_refresh: false,
-            claims: None,
-            correlation_id: None,
-        };
+        let silent_request = SilentFlowRequest::new(scopes.clone(), account.clone());
 
         match app.acquire_token_silent(silent_request).await {
             Ok(result) => {

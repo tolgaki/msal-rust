@@ -2,11 +2,22 @@
 //!
 //! Each acquire-token method on [`PublicClientApplication`](crate::PublicClientApplication)
 //! and [`ConfidentialClientApplication`](crate::ConfidentialClientApplication)
-//! takes a dedicated request struct. Fields common across requests (like
-//! `claims` and `correlation_id`) are optional.
-
-/// A list of OAuth 2.0 scopes.
-pub type Scopes = Vec<String>;
+//! takes a dedicated request struct. Use the provided constructors for common
+//! cases, or set all fields directly for full control.
+//!
+//! ```
+//! use msal::request::DeviceCodeRequest;
+//!
+//! // Short form:
+//! let req = DeviceCodeRequest::new(vec!["user.read".into()]);
+//!
+//! // Full form (equivalent):
+//! let req = DeviceCodeRequest {
+//!     scopes: vec!["user.read".into()],
+//!     claims: None,
+//!     correlation_id: None,
+//! };
+//! ```
 
 /// Parameters for the authorization code exchange.
 ///
@@ -17,7 +28,7 @@ pub struct AuthorizationCodeRequest {
     /// The authorization code received from the authorization endpoint.
     pub code: String,
     /// Scopes to request.
-    pub scopes: Scopes,
+    pub scopes: Vec<String>,
     /// The redirect URI that was used in the authorization request.
     pub redirect_uri: String,
     /// The PKCE code verifier (required for public clients).
@@ -28,17 +39,42 @@ pub struct AuthorizationCodeRequest {
     pub correlation_id: Option<String>,
 }
 
+impl AuthorizationCodeRequest {
+    /// Create a request with the required fields; optional fields default to `None`.
+    pub fn new(code: String, scopes: Vec<String>, redirect_uri: String) -> Self {
+        Self {
+            code,
+            scopes,
+            redirect_uri,
+            code_verifier: None,
+            claims: None,
+            correlation_id: None,
+        }
+    }
+}
+
 /// Parameters for the client credentials flow (app-only, no user).
 ///
 /// Used with [`ConfidentialClientApplication::acquire_token_by_client_credential`](crate::ConfidentialClientApplication::acquire_token_by_client_credential).
 #[derive(Debug, Clone)]
 pub struct ClientCredentialRequest {
     /// Scopes to request (typically `["https://graph.microsoft.com/.default"]`).
-    pub scopes: Scopes,
+    pub scopes: Vec<String>,
     /// Additional claims requested by the resource.
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+}
+
+impl ClientCredentialRequest {
+    /// Create a request with scopes; optional fields default to `None`.
+    pub fn new(scopes: Vec<String>) -> Self {
+        Self {
+            scopes,
+            claims: None,
+            correlation_id: None,
+        }
+    }
 }
 
 /// Parameters for the device code flow.
@@ -47,11 +83,22 @@ pub struct ClientCredentialRequest {
 #[derive(Debug, Clone)]
 pub struct DeviceCodeRequest {
     /// Scopes to request.
-    pub scopes: Scopes,
+    pub scopes: Vec<String>,
     /// Additional claims requested by the resource.
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+}
+
+impl DeviceCodeRequest {
+    /// Create a request with scopes; optional fields default to `None`.
+    pub fn new(scopes: Vec<String>) -> Self {
+        Self {
+            scopes,
+            claims: None,
+            correlation_id: None,
+        }
+    }
 }
 
 /// Parameters for silent token acquisition (cache and/or refresh token).
@@ -61,7 +108,7 @@ pub struct DeviceCodeRequest {
 #[derive(Debug, Clone)]
 pub struct SilentFlowRequest {
     /// Scopes to request.
-    pub scopes: Scopes,
+    pub scopes: Vec<String>,
     /// The account to acquire a token for.
     pub account: crate::account::AccountInfo,
     /// Force a token refresh even if a cached token is available.
@@ -72,6 +119,19 @@ pub struct SilentFlowRequest {
     pub correlation_id: Option<String>,
 }
 
+impl SilentFlowRequest {
+    /// Create a request with the required fields; `force_refresh` defaults to `false`.
+    pub fn new(scopes: Vec<String>, account: crate::account::AccountInfo) -> Self {
+        Self {
+            scopes,
+            account,
+            force_refresh: false,
+            claims: None,
+            correlation_id: None,
+        }
+    }
+}
+
 /// Parameters for a direct refresh token exchange.
 ///
 /// Used with [`PublicClientApplication::acquire_token_by_refresh_token`](crate::PublicClientApplication::acquire_token_by_refresh_token).
@@ -80,11 +140,23 @@ pub struct RefreshTokenRequest {
     /// The refresh token to exchange.
     pub refresh_token: String,
     /// Scopes to request.
-    pub scopes: Scopes,
+    pub scopes: Vec<String>,
     /// Additional claims requested by the resource.
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+}
+
+impl RefreshTokenRequest {
+    /// Create a request with the required fields.
+    pub fn new(refresh_token: String, scopes: Vec<String>) -> Self {
+        Self {
+            refresh_token,
+            scopes,
+            claims: None,
+            correlation_id: None,
+        }
+    }
 }
 
 /// Parameters for the on-behalf-of flow.
@@ -95,11 +167,23 @@ pub struct OnBehalfOfRequest {
     /// The incoming user assertion (access token from the upstream client).
     pub user_assertion: String,
     /// Scopes to request for the downstream API.
-    pub scopes: Scopes,
+    pub scopes: Vec<String>,
     /// Additional claims requested by the resource.
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+}
+
+impl OnBehalfOfRequest {
+    /// Create a request with the required fields.
+    pub fn new(user_assertion: String, scopes: Vec<String>) -> Self {
+        Self {
+            user_assertion,
+            scopes,
+            claims: None,
+            correlation_id: None,
+        }
+    }
 }
 
 /// Parameters for the username/password (ROPC) flow.
@@ -115,11 +199,24 @@ pub struct UsernamePasswordRequest {
     /// The user's password.
     pub password: String,
     /// Scopes to request.
-    pub scopes: Scopes,
+    pub scopes: Vec<String>,
     /// Additional claims requested by the resource.
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+}
+
+impl UsernamePasswordRequest {
+    /// Create a request with the required fields.
+    pub fn new(username: String, password: String, scopes: Vec<String>) -> Self {
+        Self {
+            username,
+            password,
+            scopes,
+            claims: None,
+            correlation_id: None,
+        }
+    }
 }
 
 /// Information returned when initiating the device code flow.

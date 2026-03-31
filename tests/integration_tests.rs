@@ -27,7 +27,7 @@ fn config_builder_all_options() {
         .authority("https://login.microsoftonline.com/my-tenant")
         .client_secret("my-secret")
         .redirect_uri("http://localhost:3000/redirect")
-        .known_authorities(vec!["login.microsoftonline.com".into()])
+        .known_authorities(["login.microsoftonline.com"])
         .timeout_ms(60_000)
         .proxy("http://proxy:8080")
         .build();
@@ -281,7 +281,7 @@ fn cache_save_and_lookup() {
     let account = test_account();
     let result = test_auth_result(&account);
 
-    cache.save(&result);
+    cache.save(&result).unwrap();
 
     let scopes = vec!["user.read".into()];
     let cached = cache.lookup_access_token(&account, &scopes);
@@ -295,7 +295,7 @@ fn cache_scope_normalization() {
     let account = test_account();
     let result = test_auth_result(&account);
 
-    cache.save(&result);
+    cache.save(&result).unwrap();
 
     // Lookup with different case should still match.
     let scopes = vec!["User.Read".into()];
@@ -310,7 +310,7 @@ fn cache_expired_token_returns_none() {
     let mut result = test_auth_result(&account);
     result.expires_on = chrono::Utc::now().timestamp() - 1;
 
-    cache.save(&result);
+    cache.save(&result).unwrap();
 
     let scopes = vec!["user.read".into()];
     assert!(cache.lookup_access_token(&account, &scopes).is_none());
@@ -324,7 +324,7 @@ fn cache_near_expiry_treated_as_expired() {
     // Expires in 4 minutes — within the 5-minute buffer.
     result.expires_on = chrono::Utc::now().timestamp() + 240;
 
-    cache.save(&result);
+    cache.save(&result).unwrap();
 
     let scopes = vec!["user.read".into()];
     assert!(cache.lookup_access_token(&account, &scopes).is_none());
@@ -336,7 +336,7 @@ fn cache_refresh_token_lookup() {
     let account = test_account();
     let result = test_auth_result(&account);
 
-    cache.save(&result);
+    cache.save(&result).unwrap();
 
     let rt = cache.lookup_refresh_token(&account);
     assert_eq!(rt.as_deref(), Some("test-refresh-token"));
@@ -349,7 +349,7 @@ fn cache_no_refresh_token_returns_none() {
     let mut result = test_auth_result(&account);
     result.refresh_token = None;
 
-    cache.save(&result);
+    cache.save(&result).unwrap();
 
     assert!(cache.lookup_refresh_token(&account).is_none());
 }
@@ -362,8 +362,8 @@ fn cache_all_accounts() {
     account2.home_account_id = "uid2.utid2".into();
     account2.username = "other@example.com".into();
 
-    cache.save(&test_auth_result(&account1));
-    cache.save(&test_auth_result(&account2));
+    cache.save(&test_auth_result(&account1)).unwrap();
+    cache.save(&test_auth_result(&account2)).unwrap();
 
     assert_eq!(cache.all_accounts().len(), 2);
 }
@@ -372,7 +372,7 @@ fn cache_all_accounts() {
 fn cache_remove_account() {
     let cache = msal::cache::TokenCache::new();
     let account = test_account();
-    cache.save(&test_auth_result(&account));
+    cache.save(&test_auth_result(&account)).unwrap();
 
     assert_eq!(cache.all_accounts().len(), 1);
     cache.remove_account(&account).unwrap();
@@ -386,9 +386,9 @@ fn cache_remove_account() {
 fn cache_clear() {
     let cache = msal::cache::TokenCache::new();
     let account = test_account();
-    cache.save(&test_auth_result(&account));
+    cache.save(&test_auth_result(&account)).unwrap();
 
-    cache.clear();
+    cache.clear().unwrap();
     assert!(cache.all_accounts().is_empty());
 }
 
@@ -405,8 +405,8 @@ fn cache_different_scopes_stored_separately() {
     result2.scopes = vec!["mail.read".into()];
     result2.access_token = "token-for-mail-read".into();
 
-    cache.save(&result1);
-    cache.save(&result2);
+    cache.save(&result1).unwrap();
+    cache.save(&result2).unwrap();
 
     let cached1 = cache
         .lookup_access_token(&account, &["user.read".into()])
@@ -551,20 +551,16 @@ async fn public_client_sign_out_without_broker_clears_cache() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
-async fn public_client_authorization_url() {
+#[test]
+fn public_client_authorization_url() {
     let config = Configuration::builder("test-client-id")
         .authority("https://login.microsoftonline.com/common")
         .build();
     let app = msal::PublicClientApplication::new(config).unwrap();
 
+    let scopes = vec!["user.read".into(), "mail.read".into()];
     let (url, pkce) = app
-        .authorization_url(
-            vec!["user.read".into(), "mail.read".into()],
-            "http://localhost:3000/redirect",
-            Some("my-state"),
-        )
-        .await
+        .authorization_url(&scopes, "http://localhost:3000/redirect", Some("my-state"))
         .unwrap();
 
     assert!(url.contains("client_id=test-client-id"));
@@ -578,14 +574,14 @@ async fn public_client_authorization_url() {
     assert!(!pkce.challenge.is_empty());
 }
 
-#[tokio::test]
-async fn public_client_auth_url_without_state() {
+#[test]
+fn public_client_auth_url_without_state() {
     let config = Configuration::builder("test-id").build();
     let app = msal::PublicClientApplication::new(config).unwrap();
 
+    let scopes = vec!["user.read".into()];
     let (url, _) = app
-        .authorization_url(vec!["user.read".into()], "http://localhost", None)
-        .await
+        .authorization_url(&scopes, "http://localhost", None)
         .unwrap();
 
     assert!(!url.contains("state="));
@@ -692,4 +688,39 @@ fn build_test_jwt(payload: &serde_json::Value) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
     let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
     format!("{header}.{payload_b64}.fakesignature")
+}
+
+// ── Send + Sync compile-time assertions ─────────────────────────────────
+
+fn _assert_send<T: Send>() {}
+fn _assert_sync<T: Sync>() {}
+
+#[test]
+fn public_client_is_send_sync() {
+    _assert_send::<msal::PublicClientApplication>();
+    _assert_sync::<msal::PublicClientApplication>();
+}
+
+#[test]
+fn confidential_client_is_send_sync() {
+    _assert_send::<msal::ConfidentialClientApplication>();
+    _assert_sync::<msal::ConfidentialClientApplication>();
+}
+
+#[test]
+fn token_cache_is_send_sync() {
+    _assert_send::<msal::cache::TokenCache>();
+    _assert_sync::<msal::cache::TokenCache>();
+}
+
+#[test]
+fn authentication_result_is_send_sync() {
+    _assert_send::<msal::AuthenticationResult>();
+    _assert_sync::<msal::AuthenticationResult>();
+}
+
+#[test]
+fn msal_error_is_send_sync() {
+    _assert_send::<msal::MsalError>();
+    _assert_sync::<msal::MsalError>();
 }

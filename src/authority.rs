@@ -18,7 +18,7 @@ use url::Url;
 use crate::error::{MsalError, Result};
 
 /// The type of identity authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthorityType {
     /// Azure Active Directory (single-tenant or multi-tenant).
     Aad,
@@ -53,8 +53,8 @@ pub struct Authority {
 }
 
 /// OpenID Connect discovery document response.
-#[derive(Debug, Deserialize)]
-pub struct OpenIdConfig {
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct OpenIdConfig {
     /// OAuth 2.0 authorization endpoint URL.
     pub authorization_endpoint: String,
     /// OAuth 2.0 token endpoint URL.

@@ -55,6 +55,10 @@ pub struct TokenCache {
     accounts: RwLock<HashMap<String, AccountInfo>>,
 }
 
+fn lock_write_err() -> MsalError {
+    MsalError::CacheError("lock poisoned".into())
+}
+
 impl TokenCache {
     /// Create an empty token cache.
     pub fn new() -> Self {
@@ -66,49 +70,58 @@ impl TokenCache {
     }
 
     /// Store tokens and account from an [`AuthenticationResult`].
-    pub fn save(&self, result: &AuthenticationResult) {
-        if let Some(ref account) = result.account {
-            let mut normalized_scopes: Vec<String> =
-                result.scopes.iter().map(|s| s.to_lowercase()).collect();
-            normalized_scopes.sort();
+    ///
+    /// Returns an error if a cache lock is poisoned (indicates a prior panic).
+    pub fn save(&self, result: &AuthenticationResult) -> Result<()> {
+        let Some(ref account) = result.account else {
+            return Ok(());
+        };
 
-            let key = AccessTokenKey {
-                home_account_id: account.home_account_id.clone(),
-                environment: account.environment.clone(),
-                scope_set: normalized_scopes.join(" "),
-                tenant_id: account.tenant_id.clone(),
-            };
+        let mut normalized_scopes: Vec<String> =
+            result.scopes.iter().map(|s| s.to_lowercase()).collect();
+        normalized_scopes.sort();
 
-            if let Ok(mut tokens) = self.access_tokens.write() {
-                tokens.insert(
-                    key,
-                    AccessTokenEntry {
-                        access_token: result.access_token.clone(),
-                        expires_on: result.expires_on,
-                        ext_expires_on: result.ext_expires_on,
-                        scopes: result.scopes.clone(),
-                        token_type: result.token_type.clone(),
+        let key = AccessTokenKey {
+            home_account_id: account.home_account_id.clone(),
+            environment: account.environment.clone(),
+            scope_set: normalized_scopes.join(" "),
+            tenant_id: account.tenant_id.clone(),
+        };
+
+        self.access_tokens
+            .write()
+            .map_err(|_| lock_write_err())?
+            .insert(
+                key,
+                AccessTokenEntry {
+                    access_token: result.access_token.clone(),
+                    expires_on: result.expires_on,
+                    ext_expires_on: result.ext_expires_on,
+                    scopes: result.scopes.clone(),
+                    token_type: result.token_type.clone(),
+                },
+            );
+
+        if let Some(ref rt) = result.refresh_token {
+            self.refresh_tokens
+                .write()
+                .map_err(|_| lock_write_err())?
+                .insert(
+                    account.home_account_id.clone(),
+                    RefreshTokenEntry {
+                        refresh_token: rt.clone(),
+                        home_account_id: account.home_account_id.clone(),
+                        environment: account.environment.clone(),
                     },
                 );
-            }
-
-            if let Some(ref rt) = result.refresh_token {
-                if let Ok(mut rts) = self.refresh_tokens.write() {
-                    rts.insert(
-                        account.home_account_id.clone(),
-                        RefreshTokenEntry {
-                            refresh_token: rt.clone(),
-                            home_account_id: account.home_account_id.clone(),
-                            environment: account.environment.clone(),
-                        },
-                    );
-                }
-            }
-
-            if let Ok(mut accts) = self.accounts.write() {
-                accts.insert(account.cache_key(), account.clone());
-            }
         }
+
+        self.accounts
+            .write()
+            .map_err(|_| lock_write_err())?
+            .insert(account.cache_key(), account.clone());
+
+        Ok(())
     }
 
     /// Look up a cached access token for the given account and scopes.
@@ -174,33 +187,34 @@ impl TokenCache {
 
         self.accounts
             .write()
-            .map_err(|_| MsalError::CacheError("lock poisoned".into()))?
+            .map_err(|_| lock_write_err())?
             .remove(&cache_key);
 
         self.access_tokens
             .write()
-            .map_err(|_| MsalError::CacheError("lock poisoned".into()))?
+            .map_err(|_| lock_write_err())?
             .retain(|k, _| k.home_account_id != account.home_account_id);
 
         self.refresh_tokens
             .write()
-            .map_err(|_| MsalError::CacheError("lock poisoned".into()))?
+            .map_err(|_| lock_write_err())?
             .remove(&account.home_account_id);
 
         Ok(())
     }
 
     /// Remove all tokens and accounts from the cache.
-    pub fn clear(&self) {
-        if let Ok(mut t) = self.access_tokens.write() {
-            t.clear();
-        }
-        if let Ok(mut r) = self.refresh_tokens.write() {
-            r.clear();
-        }
-        if let Ok(mut a) = self.accounts.write() {
-            a.clear();
-        }
+    pub fn clear(&self) -> Result<()> {
+        self.access_tokens
+            .write()
+            .map_err(|_| lock_write_err())?
+            .clear();
+        self.refresh_tokens
+            .write()
+            .map_err(|_| lock_write_err())?
+            .clear();
+        self.accounts.write().map_err(|_| lock_write_err())?.clear();
+        Ok(())
     }
 }
 
@@ -247,7 +261,7 @@ mod tests {
         let account = test_account();
         let result = test_result(&account);
 
-        cache.save(&result);
+        cache.save(&result).unwrap();
 
         let scopes = vec!["user.read".into()];
         let cached = cache.lookup_access_token(&account, &scopes);
@@ -262,7 +276,7 @@ mod tests {
         let mut result = test_result(&account);
         result.expires_on = chrono::Utc::now().timestamp() - 1; // Already expired.
 
-        cache.save(&result);
+        cache.save(&result).unwrap();
 
         let scopes = vec!["user.read".into()];
         assert!(cache.lookup_access_token(&account, &scopes).is_none());
@@ -274,7 +288,7 @@ mod tests {
         let account = test_account();
         let result = test_result(&account);
 
-        cache.save(&result);
+        cache.save(&result).unwrap();
 
         let rt = cache.lookup_refresh_token(&account);
         assert_eq!(rt.as_deref(), Some("refresh-token-value"));
@@ -286,7 +300,7 @@ mod tests {
         let account = test_account();
         let result = test_result(&account);
 
-        cache.save(&result);
+        cache.save(&result).unwrap();
         assert_eq!(cache.all_accounts().len(), 1);
 
         cache.remove_account(&account).unwrap();
@@ -300,8 +314,8 @@ mod tests {
         let account = test_account();
         let result = test_result(&account);
 
-        cache.save(&result);
-        cache.clear();
+        cache.save(&result).unwrap();
+        cache.clear().unwrap();
 
         assert!(cache.all_accounts().is_empty());
     }

@@ -9,14 +9,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = PublicClientApplication::new(config)?;
 
-    let request = DeviceCodeRequest {
-        scopes: vec!["user.read".into()],
-        claims: None,
-        correlation_id: None,
-    };
-
     let result = app
-        .acquire_token_by_device_code(request, |info| {
+        .acquire_token_by_device_code(DeviceCodeRequest::new(vec!["user.read".into()]), |info| {
             println!("{}", info.message);
             println!("Go to: {}", info.verification_uri);
             println!("Enter code: {}", info.user_code);

@@ -21,12 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In a real app, this comes from the Authorization header.
     let incoming_token = "eyJ...the-token-from-the-frontend...";
 
-    let request = OnBehalfOfRequest {
-        user_assertion: incoming_token.into(),
-        scopes: vec!["https://graph.microsoft.com/User.Read".into()],
-        claims: None,
-        correlation_id: None,
-    };
+    let request = OnBehalfOfRequest::new(
+        incoming_token.into(),
+        vec!["https://graph.microsoft.com/User.Read".into()],
+    );
 
     let result = app.acquire_token_on_behalf_of(request).await?;
     println!(

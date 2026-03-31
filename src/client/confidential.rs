@@ -4,12 +4,11 @@ use crate::account::AccountInfo;
 use crate::client::AppState;
 use crate::config::{ClientCredential, Configuration};
 use crate::error::{MsalError, Result};
-use crate::network::post_token_request;
 use crate::request::{
     AuthorizationCodeRequest, ClientCredentialRequest, OnBehalfOfRequest, RefreshTokenRequest,
     SilentFlowRequest,
 };
-use crate::response::{AuthenticationResult, TokenResponse};
+use crate::response::AuthenticationResult;
 
 /// Confidential client application for server-side authentication.
 ///
@@ -44,23 +43,21 @@ impl ConfidentialClientApplication {
         request: ClientCredentialRequest,
     ) -> Result<AuthenticationResult> {
         let scope_str = request.scopes.join(" ");
-
-        let mut params: Vec<(&str, String)> = vec![
-            ("client_id", self.state.config.auth.client_id.clone()),
-            ("grant_type", "client_credentials".into()),
-            ("scope", scope_str),
+        let mut params = vec![
+            ("client_id", self.state.config.auth.client_id.as_str()),
+            ("grant_type", "client_credentials"),
+            ("scope", scope_str.as_str()),
         ];
+        append_credential(&self.state.config.auth.client_credential, &mut params)?;
 
-        append_client_credential(&self.state.config.auth.client_credential, &mut params)?;
-
-        let params_ref: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let body = post_token_request(
+        // Client credential flow has no user — don't cache (no account key).
+        let body = crate::network::post_token_request(
             &self.state.http,
             &self.state.authority.token_endpoint,
-            &params_ref,
+            &params,
         )
         .await?;
-        let token_resp: TokenResponse = serde_json::from_value(body)?;
+        let token_resp: crate::response::TokenResponse = serde_json::from_value(body)?;
         Ok(token_resp.into_authentication_result())
     }
 
@@ -70,32 +67,19 @@ impl ConfidentialClientApplication {
         request: AuthorizationCodeRequest,
     ) -> Result<AuthenticationResult> {
         let scope_str = request.scopes.join(" ");
-
-        let mut params: Vec<(&str, String)> = vec![
-            ("client_id", self.state.config.auth.client_id.clone()),
-            ("grant_type", "authorization_code".into()),
-            ("code", request.code),
-            ("redirect_uri", request.redirect_uri),
-            ("scope", scope_str),
+        let mut params = vec![
+            ("client_id", self.state.config.auth.client_id.as_str()),
+            ("grant_type", "authorization_code"),
+            ("code", request.code.as_str()),
+            ("redirect_uri", request.redirect_uri.as_str()),
+            ("scope", scope_str.as_str()),
         ];
-
-        if let Some(v) = request.code_verifier {
+        if let Some(ref v) = request.code_verifier {
             params.push(("code_verifier", v));
         }
+        append_credential(&self.state.config.auth.client_credential, &mut params)?;
 
-        append_client_credential(&self.state.config.auth.client_credential, &mut params)?;
-
-        let params_ref: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let body = post_token_request(
-            &self.state.http,
-            &self.state.authority.token_endpoint,
-            &params_ref,
-        )
-        .await?;
-        let token_resp: TokenResponse = serde_json::from_value(body)?;
-        let result = token_resp.into_authentication_result();
-        self.state.cache.save(&result);
-        Ok(result)
+        self.state.exchange_and_cache(&params).await
     }
 
     /// Acquire a token on behalf of a user (OBO flow).
@@ -104,31 +88,16 @@ impl ConfidentialClientApplication {
         request: OnBehalfOfRequest,
     ) -> Result<AuthenticationResult> {
         let scope_str = request.scopes.join(" ");
-
-        let mut params: Vec<(&str, String)> = vec![
-            ("client_id", self.state.config.auth.client_id.clone()),
-            (
-                "grant_type",
-                "urn:ietf:params:oauth:grant-type:jwt-bearer".into(),
-            ),
-            ("assertion", request.user_assertion),
-            ("scope", scope_str),
-            ("requested_token_use", "on_behalf_of".into()),
+        let mut params = vec![
+            ("client_id", self.state.config.auth.client_id.as_str()),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", request.user_assertion.as_str()),
+            ("scope", scope_str.as_str()),
+            ("requested_token_use", "on_behalf_of"),
         ];
+        append_credential(&self.state.config.auth.client_credential, &mut params)?;
 
-        append_client_credential(&self.state.config.auth.client_credential, &mut params)?;
-
-        let params_ref: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let body = post_token_request(
-            &self.state.http,
-            &self.state.authority.token_endpoint,
-            &params_ref,
-        )
-        .await?;
-        let token_resp: TokenResponse = serde_json::from_value(body)?;
-        let result = token_resp.into_authentication_result();
-        self.state.cache.save(&result);
-        Ok(result)
+        self.state.exchange_and_cache(&params).await
     }
 
     /// Acquire a token silently from the cache, falling back to refresh token.
@@ -148,27 +117,15 @@ impl ConfidentialClientApplication {
 
         if let Some(rt) = self.state.cache.lookup_refresh_token(&request.account) {
             let scope_str = request.scopes.join(" ");
-            let mut params: Vec<(&str, String)> = vec![
-                ("client_id", self.state.config.auth.client_id.clone()),
-                ("grant_type", "refresh_token".into()),
-                ("refresh_token", rt),
-                ("scope", scope_str),
+            let mut params = vec![
+                ("client_id", self.state.config.auth.client_id.as_str()),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", rt.as_str()),
+                ("scope", scope_str.as_str()),
             ];
+            append_credential(&self.state.config.auth.client_credential, &mut params)?;
 
-            append_client_credential(&self.state.config.auth.client_credential, &mut params)?;
-
-            let params_ref: Vec<(&str, &str)> =
-                params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            let body = post_token_request(
-                &self.state.http,
-                &self.state.authority.token_endpoint,
-                &params_ref,
-            )
-            .await?;
-            let token_resp: TokenResponse = serde_json::from_value(body)?;
-            let result = token_resp.into_authentication_result();
-            self.state.cache.save(&result);
-            return Ok(result);
+            return self.state.exchange_and_cache(&params).await;
         }
 
         Err(MsalError::InteractionRequired(
@@ -182,27 +139,15 @@ impl ConfidentialClientApplication {
         request: RefreshTokenRequest,
     ) -> Result<AuthenticationResult> {
         let scope_str = request.scopes.join(" ");
-
-        let mut params: Vec<(&str, String)> = vec![
-            ("client_id", self.state.config.auth.client_id.clone()),
-            ("grant_type", "refresh_token".into()),
-            ("refresh_token", request.refresh_token),
-            ("scope", scope_str),
+        let mut params = vec![
+            ("client_id", self.state.config.auth.client_id.as_str()),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", request.refresh_token.as_str()),
+            ("scope", scope_str.as_str()),
         ];
+        append_credential(&self.state.config.auth.client_credential, &mut params)?;
 
-        append_client_credential(&self.state.config.auth.client_credential, &mut params)?;
-
-        let params_ref: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let body = post_token_request(
-            &self.state.http,
-            &self.state.authority.token_endpoint,
-            &params_ref,
-        )
-        .await?;
-        let token_resp: TokenResponse = serde_json::from_value(body)?;
-        let result = token_resp.into_authentication_result();
-        self.state.cache.save(&result);
-        Ok(result)
+        self.state.exchange_and_cache(&params).await
     }
 
     /// Return all accounts in the token cache.
@@ -216,20 +161,23 @@ impl ConfidentialClientApplication {
     }
 }
 
-fn append_client_credential(
-    credential: &Option<ClientCredential>,
-    params: &mut Vec<(&str, String)>,
+/// Build credential parameters as owned strings (needed because the credential
+/// values must live long enough for the request). Returns a small vec that
+/// callers extend into their params slice.
+fn append_credential<'a>(
+    credential: &'a Option<ClientCredential>,
+    params: &mut Vec<(&'a str, &'a str)>,
 ) -> Result<()> {
     match credential {
         Some(ClientCredential::Secret(secret)) => {
-            params.push(("client_secret", secret.clone()));
+            params.push(("client_secret", secret));
         }
         Some(ClientCredential::Assertion(assertion)) => {
             params.push((
                 "client_assertion_type",
-                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into(),
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
             ));
-            params.push(("client_assertion", assertion.clone()));
+            params.push(("client_assertion", assertion));
         }
         Some(ClientCredential::Certificate { .. }) => {
             return Err(MsalError::InvalidConfiguration(

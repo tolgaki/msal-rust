@@ -37,8 +37,8 @@ use objc2_authentication_services::{
     ASAuthorizationSingleSignOnCredential, ASAuthorizationSingleSignOnProvider,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSHTTPURLResponse, NSObject, NSObjectProtocol, NSString, NSURL,
-    NSURLQueryItem,
+    MainThreadMarker, NSArray, NSHTTPURLResponse, NSObject, NSObjectProtocol, NSString,
+    NSURLQueryItem, NSURL,
 };
 
 use crate::account::AccountInfo;
@@ -84,10 +84,7 @@ impl MacOsBroker {
     }
 
     /// Execute an SSO request on the main thread, returning the result via oneshot.
-    async fn perform_request(
-        &self,
-        params: SsoRequestParams,
-    ) -> Result<AuthenticationResult> {
+    async fn perform_request(&self, params: SsoRequestParams) -> Result<AuthenticationResult> {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<AuthenticationResult>>();
 
         // All ObjC work happens on the main thread.
@@ -122,9 +119,8 @@ fn execute_sso_on_main_thread(
     params: SsoRequestParams,
     tx: tokio::sync::oneshot::Sender<Result<AuthenticationResult>>,
 ) -> std::result::Result<(), MsalError> {
-    let _mtm = MainThreadMarker::new().ok_or_else(|| {
-        MsalError::AuthenticationFailed("SSO must run on main thread".into())
-    })?;
+    let _mtm = MainThreadMarker::new()
+        .ok_or_else(|| MsalError::AuthenticationFailed("SSO must run on main thread".into()))?;
 
     // Create provider.
     let ns_url_str = NSString::from_str(MS_SSO_URL);
@@ -239,10 +235,7 @@ impl NativeBroker for MacOsBroker {
                 scopes: request.scopes.join(" "),
                 operation: "login".to_string(),
                 interactive: true,
-                account_id: request
-                    .account
-                    .as_ref()
-                    .map(|a| a.home_account_id.clone()),
+                account_id: request.account.as_ref().map(|a| a.home_account_id.clone()),
                 correlation_id: request
                     .correlation_id
                     .clone()
@@ -363,8 +356,8 @@ fn parse_authorization(authorization: &ASAuthorization) -> Result<Authentication
     let credential: Retained<ASAuthorizationSingleSignOnCredential> =
         unsafe { Retained::cast_unchecked(raw_credential) };
 
-    let http_response: Retained<NSHTTPURLResponse> =
-        unsafe { credential.authenticatedResponse() }.ok_or_else(|| {
+    let http_response: Retained<NSHTTPURLResponse> = unsafe { credential.authenticatedResponse() }
+        .ok_or_else(|| {
             MsalError::AuthenticationFailed("no authenticatedResponse in SSO credential".into())
         })?;
 
@@ -425,10 +418,7 @@ fn parse_authorization(authorization: &ASAuthorization) -> Result<Authentication
         account,
         tenant_id: body["tenant_id"].as_str().map(String::from),
         correlation_id: body["correlation_id"].as_str().map(String::from),
-        token_type: body["token_type"]
-            .as_str()
-            .unwrap_or("Bearer")
-            .to_string(),
+        token_type: body["token_type"].as_str().unwrap_or("Bearer").to_string(),
         refresh_token: None,
     })
 }

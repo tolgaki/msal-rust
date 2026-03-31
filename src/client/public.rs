@@ -7,12 +7,11 @@ use crate::client::AppState;
 use crate::config::Configuration;
 use crate::crypto::PkceParams;
 use crate::error::{MsalError, Result};
-use crate::network::post_token_request;
 use crate::request::{
     AuthorizationCodeRequest, DeviceCodeInfo, DeviceCodeRequest, RefreshTokenRequest,
     SilentFlowRequest, UsernamePasswordRequest,
 };
-use crate::response::{AuthenticationResult, TokenResponse};
+use crate::response::AuthenticationResult;
 
 /// Public client application for user-based authentication flows.
 ///
@@ -21,11 +20,10 @@ use crate::response::{AuthenticationResult, TokenResponse};
 ///
 /// # Brokered Authentication
 ///
-/// Call [`set_broker`](Self::set_broker) to enable native broker support (WAM on Windows).
-/// When a broker is set and available, `acquire_token_interactive` and
-/// `acquire_token_silent` will delegate to the broker for device-bound tokens
-/// and system-wide SSO. If the broker is not available, standard OAuth flows
-/// are used.
+/// Call [`set_broker`](Self::set_broker) to enable native broker support (WAM on Windows,
+/// Enterprise SSO on macOS). When a broker is set and available,
+/// `acquire_token_interactive` and `acquire_token_silent` will delegate to
+/// the broker for device-bound tokens and system-wide SSO.
 ///
 /// **Important**: broker failures do NOT fall back to browser-based flows.
 /// If the broker returns an error, it propagates to the caller.
@@ -93,7 +91,7 @@ impl PublicClientApplication {
                 let result = broker
                     .acquire_token_interactive(&self.state.config.auth.client_id, &request)
                     .await?;
-                self.state.cache.save(&result);
+                self.state.cache.save(&result)?;
                 return Ok(result);
             }
         }
@@ -143,7 +141,7 @@ impl PublicClientApplication {
                     let result = broker
                         .acquire_token_silent(&self.state.config.auth.client_id, &broker_request)
                         .await?;
-                    self.state.cache.save(&result);
+                    self.state.cache.save(&result)?;
                     return Ok(result);
                 }
             }
@@ -158,17 +156,7 @@ impl PublicClientApplication {
                 ("refresh_token", rt.as_str()),
                 ("scope", scope_str.as_str()),
             ];
-
-            let body = post_token_request(
-                &self.state.http,
-                &self.state.authority.token_endpoint,
-                &params,
-            )
-            .await?;
-            let token_resp: TokenResponse = serde_json::from_value(body)?;
-            let result = token_resp.into_authentication_result();
-            self.state.cache.save(&result);
-            return Ok(result);
+            return self.state.exchange_and_cache(&params).await;
         }
 
         Err(MsalError::InteractionRequired(
@@ -219,9 +207,12 @@ impl PublicClientApplication {
     // ── Standard OAuth flows (non-brokered) ─────────────────────────────
 
     /// Build the authorization URL for the authorization code flow.
-    pub async fn authorization_url(
+    ///
+    /// Returns the URL and the PKCE parameters. Pass `pkce.verifier` as the
+    /// `code_verifier` when exchanging the authorization code.
+    pub fn authorization_url(
         &self,
-        scopes: Vec<String>,
+        scopes: &[String],
         redirect_uri: &str,
         state_param: Option<&str>,
     ) -> Result<(String, PkceParams)> {
@@ -235,7 +226,7 @@ impl PublicClientApplication {
             .append_pair("redirect_uri", redirect_uri)
             .append_pair("scope", &scopes.join(" "))
             .append_pair("code_challenge", &pkce.challenge)
-            .append_pair("code_challenge_method", &pkce.challenge_method)
+            .append_pair("code_challenge_method", pkce.challenge_method)
             .append_pair("nonce", &nonce);
 
         if let Some(st) = state_param {
@@ -263,16 +254,7 @@ impl PublicClientApplication {
             params.push(("code_verifier", v));
         }
 
-        let body = post_token_request(
-            &self.state.http,
-            &self.state.authority.token_endpoint,
-            &params,
-        )
-        .await?;
-        let token_resp: TokenResponse = serde_json::from_value(body)?;
-        let result = token_resp.into_authentication_result();
-        self.state.cache.save(&result);
-        Ok(result)
+        self.state.exchange_and_cache(&params).await
     }
 
     /// Initiate the device code flow and poll for completion.
@@ -310,9 +292,18 @@ impl PublicClientApplication {
         }
 
         let body: serde_json::Value = resp.json().await?;
+
+        let device_code = body["device_code"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                MsalError::AuthenticationFailed("missing device_code in response".into())
+            })?
+            .to_string();
+
         let device_info = DeviceCodeInfo {
             user_code: body["user_code"].as_str().unwrap_or_default().to_string(),
-            device_code: body["device_code"].as_str().unwrap_or_default().to_string(),
+            device_code,
             verification_uri: body["verification_uri"]
                 .as_str()
                 .unwrap_or_default()
@@ -342,20 +333,8 @@ impl PublicClientApplication {
                 ("device_code", &device_info.device_code),
             ];
 
-            let poll_result = post_token_request(
-                &self.state.http,
-                &self.state.authority.token_endpoint,
-                &poll_params,
-            )
-            .await;
-
-            match poll_result {
-                Ok(body) => {
-                    let token_resp: TokenResponse = serde_json::from_value(body)?;
-                    let result = token_resp.into_authentication_result();
-                    self.state.cache.save(&result);
-                    return Ok(result);
-                }
+            match self.state.exchange_and_cache(&poll_params).await {
+                Ok(result) => return Ok(result),
                 Err(MsalError::AuthorizationPending) => continue,
                 Err(MsalError::DeviceCodeExpired) => return Err(MsalError::DeviceCodeExpired),
                 Err(e) => return Err(e),
@@ -375,17 +354,7 @@ impl PublicClientApplication {
             ("refresh_token", request.refresh_token.as_str()),
             ("scope", scope_str.as_str()),
         ];
-
-        let body = post_token_request(
-            &self.state.http,
-            &self.state.authority.token_endpoint,
-            &params,
-        )
-        .await?;
-        let token_resp: TokenResponse = serde_json::from_value(body)?;
-        let result = token_resp.into_authentication_result();
-        self.state.cache.save(&result);
-        Ok(result)
+        self.state.exchange_and_cache(&params).await
     }
 
     /// Acquire a token using username and password (ROPC).
@@ -403,22 +372,12 @@ impl PublicClientApplication {
             ("password", request.password.as_str()),
             ("scope", scope_str.as_str()),
         ];
-
-        let body = post_token_request(
-            &self.state.http,
-            &self.state.authority.token_endpoint,
-            &params,
-        )
-        .await?;
-        let token_resp: TokenResponse = serde_json::from_value(body)?;
-        let result = token_resp.into_authentication_result();
-        self.state.cache.save(&result);
-        Ok(result)
+        self.state.exchange_and_cache(&params).await
     }
 
     /// Remove an account from the local cache (does not sign out from broker).
     /// Use [`sign_out`](Self::sign_out) for full broker + cache cleanup.
-    pub async fn remove_account(&self, account: &AccountInfo) -> Result<()> {
+    pub fn remove_account(&self, account: &AccountInfo) -> Result<()> {
         self.state.cache.remove_account(account)
     }
 }

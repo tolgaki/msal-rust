@@ -1,4 +1,4 @@
-use msal::request::AuthorizationCodeRequest;
+use msal::request::{AuthorizationCodeRequest, SilentFlowRequest};
 use msal::{Configuration, PublicClientApplication};
 
 #[tokio::main]
@@ -10,28 +10,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = PublicClientApplication::new(config)?;
 
     // Step 1: Get the authorization URL (send user to this URL).
-    let (auth_url, pkce) = app
-        .authorization_url(
-            vec!["user.read".into()],
-            "http://localhost:3000/redirect",
-            None,
-        )
-        .await?;
+    let scopes = vec!["user.read".into()];
+    let (auth_url, pkce) =
+        app.authorization_url(&scopes, "http://localhost:3000/redirect", None)?;
 
     println!("Open this URL in a browser:\n{auth_url}\n");
 
     // Step 2: After the user authenticates, exchange the code.
-    // In a real app, you'd extract the code from the redirect callback.
     let code = "PASTE_AUTH_CODE_HERE";
-
-    let request = AuthorizationCodeRequest {
-        code: code.into(),
-        scopes: vec!["user.read".into()],
-        redirect_uri: "http://localhost:3000/redirect".into(),
-        code_verifier: Some(pkce.verifier),
-        claims: None,
-        correlation_id: None,
-    };
+    let mut request = AuthorizationCodeRequest::new(
+        code.into(),
+        scopes.clone(),
+        "http://localhost:3000/redirect".into(),
+    );
+    request.code_verifier = Some(pkce.verifier);
 
     let result = app.acquire_token_by_code(request).await?;
 
@@ -41,15 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Signed in as: {}", account.username);
 
         // Step 3: Later, acquire tokens silently.
-        let silent_request = msal::request::SilentFlowRequest {
-            scopes: vec!["user.read".into()],
-            account: account.clone(),
-            force_refresh: false,
-            claims: None,
-            correlation_id: None,
-        };
-
-        let cached = app.acquire_token_silent(silent_request).await?;
+        let silent = SilentFlowRequest::new(scopes, account.clone());
+        let cached = app.acquire_token_silent(silent).await?;
         println!("Cached token: {}...", &cached.access_token[..20]);
     }
 

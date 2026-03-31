@@ -159,8 +159,11 @@ impl ConfigurationBuilder {
     }
 
     /// Add trusted authority hosts for authority validation.
-    pub fn known_authorities(mut self, authorities: Vec<String>) -> Self {
-        self.known_authorities = authorities;
+    pub fn known_authorities(
+        mut self,
+        authorities: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.known_authorities = authorities.into_iter().map(Into::into).collect();
         self
     }
 

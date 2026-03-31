@@ -49,6 +49,7 @@ use crate::response::AuthenticationResult;
 /// Authentication scheme for token requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum AuthenticationScheme {
+    /// Standard Bearer token (default).
     #[default]
     Bearer,
     /// Proof-of-Possession: tokens are bound to the requesting client.
@@ -89,7 +90,9 @@ pub struct BrokerTokenRequest {
 /// Request for broker sign-out.
 #[derive(Debug, Clone)]
 pub struct BrokerSignOutRequest {
+    /// The account to sign out.
     pub account: AccountInfo,
+    /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
 }
 
