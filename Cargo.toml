@@ -1,0 +1,47 @@
+[package]
+name = "msal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Microsoft Authentication Library (MSAL) for Rust — authenticate with Azure AD, Microsoft accounts, and Azure AD B2C"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/tolgaki/msal-rust"
+homepage = "https://github.com/tolgaki/msal-rust"
+documentation = "https://docs.rs/msal"
+keywords = ["azure", "msal", "oauth2", "authentication", "microsoft"]
+categories = ["authentication", "web-programming"]
+
+[features]
+default = []
+broker-wam = ["windows"]
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+jsonwebtoken = "9"
+rand = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", optional = true, features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Security_Authentication_Web_Core",
+    "Security_Credentials",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"
+
+[package.metadata.docs.rs]
+all-features = false
+rustdoc-args = ["--cfg", "docsrs"]
