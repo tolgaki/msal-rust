@@ -36,6 +36,20 @@ pub async fn post_token_request(
     let resp = http.post(url).form(params).send().await?;
 
     let status = resp.status();
+
+    // Handle HTTP 429 (Too Many Requests) before parsing body.
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+        return Err(MsalError::Throttled {
+            retry_after_secs: retry_after,
+        });
+    }
+
     let body: serde_json::Value = resp.json().await?;
 
     if !status.is_success() {

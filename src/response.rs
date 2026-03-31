@@ -98,7 +98,7 @@ impl TokenResponse {
                 .or_else(|| claims["sub"].as_str())
                 .unwrap_or_default()
                 .to_string(),
-            environment: "login.microsoftonline.com".into(),
+            environment: crate::account::AAD_PUBLIC_CLOUD_ENVIRONMENT.into(),
             tenant_id: claims["tid"].as_str().unwrap_or_default().to_string(),
             username: claims["preferred_username"]
                 .as_str()

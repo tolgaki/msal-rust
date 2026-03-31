@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 1: Get the authorization URL (send user to this URL).
     let (auth_url, pkce) = app
-        .get_authorization_url(
+        .authorization_url(
             vec!["user.read".into()],
             "http://localhost:3000/redirect",
             None,

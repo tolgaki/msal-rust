@@ -29,16 +29,18 @@ use crate::response::{AuthenticationResult, TokenResponse};
 ///
 /// **Important**: broker failures do NOT fall back to browser-based flows.
 /// If the broker returns an error, it propagates to the caller.
+#[derive(Clone)]
 pub struct PublicClientApplication {
-    state: Arc<RwLock<AppState>>,
+    state: Arc<AppState>,
     broker: Arc<RwLock<Option<Box<dyn NativeBroker>>>>,
 }
 
 impl PublicClientApplication {
+    /// Create a new public client application.
     pub fn new(config: Configuration) -> Result<Self> {
         let state = AppState::new(config)?;
         Ok(Self {
-            state: Arc::new(RwLock::new(state)),
+            state: Arc::new(state),
             broker: Arc::new(RwLock::new(None)),
         })
     }
@@ -88,11 +90,10 @@ impl PublicClientApplication {
         let b = self.broker.read().await;
         if let Some(ref broker) = *b {
             if broker.is_available() {
-                let s = self.state.read().await;
                 let result = broker
-                    .acquire_token_interactive(&s.config.auth.client_id, &request)
+                    .acquire_token_interactive(&self.state.config.auth.client_id, &request)
                     .await?;
-                s.cache.save(&result);
+                self.state.cache.save(&result);
                 return Ok(result);
             }
         }
@@ -114,11 +115,10 @@ impl PublicClientApplication {
         &self,
         request: SilentFlowRequest,
     ) -> Result<AuthenticationResult> {
-        let s = self.state.read().await;
-
         // 1. Try local cache.
         if !request.force_refresh {
-            if let Some(cached) = s
+            if let Some(cached) = self
+                .state
                 .cache
                 .lookup_access_token(&request.account, &request.scopes)
             {
@@ -141,28 +141,33 @@ impl PublicClientApplication {
                         pop_params: None,
                     };
                     let result = broker
-                        .acquire_token_silent(&s.config.auth.client_id, &broker_request)
+                        .acquire_token_silent(&self.state.config.auth.client_id, &broker_request)
                         .await?;
-                    s.cache.save(&result);
+                    self.state.cache.save(&result);
                     return Ok(result);
                 }
             }
         }
 
         // 3. Try refresh token (standard OAuth).
-        if let Some(rt) = s.cache.lookup_refresh_token(&request.account) {
+        if let Some(rt) = self.state.cache.lookup_refresh_token(&request.account) {
             let scope_str = request.scopes.join(" ");
             let params = [
-                ("client_id", s.config.auth.client_id.as_str()),
+                ("client_id", self.state.config.auth.client_id.as_str()),
                 ("grant_type", "refresh_token"),
                 ("refresh_token", rt.as_str()),
                 ("scope", scope_str.as_str()),
             ];
 
-            let body = post_token_request(&s.http, &s.authority.token_endpoint, &params).await?;
+            let body = post_token_request(
+                &self.state.http,
+                &self.state.authority.token_endpoint,
+                &params,
+            )
+            .await?;
             let token_resp: TokenResponse = serde_json::from_value(body)?;
             let result = token_resp.into_authentication_result();
-            s.cache.save(&result);
+            self.state.cache.save(&result);
             return Ok(result);
         }
 
@@ -180,57 +185,52 @@ impl PublicClientApplication {
             let b = self.broker.read().await;
             if let Some(ref broker) = *b {
                 if broker.is_available() {
-                    let s = self.state.read().await;
                     let sign_out_request = BrokerSignOutRequest {
                         account: account.clone(),
                         correlation_id: None,
                     };
                     broker
-                        .sign_out(&s.config.auth.client_id, &sign_out_request)
+                        .sign_out(&self.state.config.auth.client_id, &sign_out_request)
                         .await?;
                 }
             }
         }
 
         // Clear local cache.
-        let s = self.state.read().await;
-        s.cache.remove_account(account)
+        self.state.cache.remove_account(account)
     }
 
-    /// Get all accounts. If a broker is configured, returns broker accounts;
+    /// Return all accounts. If a broker is configured, returns broker accounts;
     /// otherwise returns accounts from the local token cache.
-    pub async fn get_all_accounts(&self) -> Result<Vec<AccountInfo>> {
+    pub async fn all_accounts(&self) -> Result<Vec<AccountInfo>> {
         let b = self.broker.read().await;
         if let Some(ref broker) = *b {
             if broker.is_available() {
-                let s = self.state.read().await;
                 let correlation_id = crate::crypto::generate_correlation_id();
                 return broker
-                    .get_all_accounts(&s.config.auth.client_id, &correlation_id)
+                    .all_accounts(&self.state.config.auth.client_id, &correlation_id)
                     .await;
             }
         }
 
-        let s = self.state.read().await;
-        Ok(s.cache.all_accounts())
+        Ok(self.state.cache.all_accounts())
     }
 
     // ── Standard OAuth flows (non-brokered) ─────────────────────────────
 
     /// Build the authorization URL for the authorization code flow.
-    pub async fn get_authorization_url(
+    pub async fn authorization_url(
         &self,
         scopes: Vec<String>,
         redirect_uri: &str,
         state_param: Option<&str>,
     ) -> Result<(String, PkceParams)> {
-        let s = self.state.read().await;
         let pkce = PkceParams::generate();
         let nonce = crate::crypto::generate_nonce();
 
-        let mut url = url::Url::parse(&s.authority.authorization_endpoint)?;
+        let mut url = url::Url::parse(&self.state.authority.authorization_endpoint)?;
         url.query_pairs_mut()
-            .append_pair("client_id", &s.config.auth.client_id)
+            .append_pair("client_id", &self.state.config.auth.client_id)
             .append_pair("response_type", "code")
             .append_pair("redirect_uri", redirect_uri)
             .append_pair("scope", &scopes.join(" "))
@@ -250,10 +250,9 @@ impl PublicClientApplication {
         &self,
         request: AuthorizationCodeRequest,
     ) -> Result<AuthenticationResult> {
-        let s = self.state.read().await;
         let scope_str = request.scopes.join(" ");
         let mut params: Vec<(&str, &str)> = vec![
-            ("client_id", &s.config.auth.client_id),
+            ("client_id", &self.state.config.auth.client_id),
             ("grant_type", "authorization_code"),
             ("code", &request.code),
             ("redirect_uri", &request.redirect_uri),
@@ -264,10 +263,15 @@ impl PublicClientApplication {
             params.push(("code_verifier", v));
         }
 
-        let body = post_token_request(&s.http, &s.authority.token_endpoint, &params).await?;
+        let body = post_token_request(
+            &self.state.http,
+            &self.state.authority.token_endpoint,
+            &params,
+        )
+        .await?;
         let token_resp: TokenResponse = serde_json::from_value(body)?;
         let result = token_resp.into_authentication_result();
-        s.cache.save(&result);
+        self.state.cache.save(&result);
         Ok(result)
     }
 
@@ -283,18 +287,17 @@ impl PublicClientApplication {
     where
         F: FnOnce(&DeviceCodeInfo),
     {
-        let s = self.state.read().await;
-
         // Step 1: Initiate device code flow.
         let scope_str = request.scopes.join(" ");
         let init_params = [
-            ("client_id", s.config.auth.client_id.as_str()),
+            ("client_id", self.state.config.auth.client_id.as_str()),
             ("scope", &scope_str),
         ];
 
-        let resp = s
+        let resp = self
+            .state
             .http
-            .post(&s.authority.device_code_endpoint)
+            .post(&self.state.authority.device_code_endpoint)
             .form(&init_params)
             .send()
             .await?;
@@ -321,7 +324,7 @@ impl PublicClientApplication {
 
         callback(&device_info);
 
-        // Step 2: Poll for token.
+        // Step 2: Poll for token (no lock held across awaits).
         let interval = std::time::Duration::from_secs(device_info.interval);
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(device_info.expires_in);
@@ -334,19 +337,23 @@ impl PublicClientApplication {
             }
 
             let poll_params = [
-                ("client_id", s.config.auth.client_id.as_str()),
+                ("client_id", self.state.config.auth.client_id.as_str()),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", &device_info.device_code),
             ];
 
-            let poll_result =
-                post_token_request(&s.http, &s.authority.token_endpoint, &poll_params).await;
+            let poll_result = post_token_request(
+                &self.state.http,
+                &self.state.authority.token_endpoint,
+                &poll_params,
+            )
+            .await;
 
             match poll_result {
                 Ok(body) => {
                     let token_resp: TokenResponse = serde_json::from_value(body)?;
                     let result = token_resp.into_authentication_result();
-                    s.cache.save(&result);
+                    self.state.cache.save(&result);
                     return Ok(result);
                 }
                 Err(MsalError::AuthorizationPending) => continue,
@@ -361,19 +368,23 @@ impl PublicClientApplication {
         &self,
         request: RefreshTokenRequest,
     ) -> Result<AuthenticationResult> {
-        let s = self.state.read().await;
         let scope_str = request.scopes.join(" ");
         let params = [
-            ("client_id", s.config.auth.client_id.as_str()),
+            ("client_id", self.state.config.auth.client_id.as_str()),
             ("grant_type", "refresh_token"),
             ("refresh_token", request.refresh_token.as_str()),
             ("scope", scope_str.as_str()),
         ];
 
-        let body = post_token_request(&s.http, &s.authority.token_endpoint, &params).await?;
+        let body = post_token_request(
+            &self.state.http,
+            &self.state.authority.token_endpoint,
+            &params,
+        )
+        .await?;
         let token_resp: TokenResponse = serde_json::from_value(body)?;
         let result = token_resp.into_authentication_result();
-        s.cache.save(&result);
+        self.state.cache.save(&result);
         Ok(result)
     }
 
@@ -384,27 +395,30 @@ impl PublicClientApplication {
         &self,
         request: UsernamePasswordRequest,
     ) -> Result<AuthenticationResult> {
-        let s = self.state.read().await;
         let scope_str = request.scopes.join(" ");
         let params = [
-            ("client_id", s.config.auth.client_id.as_str()),
+            ("client_id", self.state.config.auth.client_id.as_str()),
             ("grant_type", "password"),
             ("username", request.username.as_str()),
             ("password", request.password.as_str()),
             ("scope", scope_str.as_str()),
         ];
 
-        let body = post_token_request(&s.http, &s.authority.token_endpoint, &params).await?;
+        let body = post_token_request(
+            &self.state.http,
+            &self.state.authority.token_endpoint,
+            &params,
+        )
+        .await?;
         let token_resp: TokenResponse = serde_json::from_value(body)?;
         let result = token_resp.into_authentication_result();
-        s.cache.save(&result);
+        self.state.cache.save(&result);
         Ok(result)
     }
 
     /// Remove an account from the local cache (does not sign out from broker).
     /// Use [`sign_out`](Self::sign_out) for full broker + cache cleanup.
     pub async fn remove_account(&self, account: &AccountInfo) -> Result<()> {
-        let s = self.state.read().await;
-        s.cache.remove_account(account)
+        self.state.cache.remove_account(account)
     }
 }

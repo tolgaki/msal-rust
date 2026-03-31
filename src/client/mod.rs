@@ -16,6 +16,10 @@ use crate::config::Configuration;
 use crate::error::Result;
 
 /// Shared internal state for client applications.
+///
+/// Immutable after construction — `TokenCache` provides its own interior
+/// mutability via `std::sync::RwLock`. This struct is stored behind `Arc`
+/// (no outer lock needed).
 pub(crate) struct AppState {
     pub config: Configuration,
     pub http: reqwest::Client,
@@ -34,12 +38,5 @@ impl AppState {
             cache,
             authority,
         })
-    }
-
-    /// Re-resolve authority metadata via OpenID Connect discovery.
-    #[allow(dead_code)] // Used by clients that opt into runtime discovery.
-    pub async fn resolve_authority(&mut self) -> Result<()> {
-        self.authority = Authority::resolve(&self.config.auth.authority, &self.http).await?;
-        Ok(())
     }
 }

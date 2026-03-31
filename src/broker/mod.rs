@@ -134,15 +134,15 @@ pub trait NativeBroker: Send + Sync {
         request: &'a BrokerSignOutRequest,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
-    /// Get all accounts known to the broker for this client.
-    fn get_all_accounts<'a>(
+    /// Return all accounts known to the broker for this client.
+    fn all_accounts<'a>(
         &'a self,
         client_id: &'a str,
         correlation_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AccountInfo>>> + Send + 'a>>;
 
-    /// Get a specific account by its home_account_id.
-    fn get_account<'a>(
+    /// Look up a specific account by its home_account_id.
+    fn account<'a>(
         &'a self,
         account_id: &'a str,
         correlation_id: &'a str,

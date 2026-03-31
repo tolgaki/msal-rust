@@ -482,10 +482,10 @@ fn broker_token_request_construction() {
 // ── Async Client Tests ──────────────────────────────────────────────────
 
 #[tokio::test]
-async fn public_client_get_all_accounts_empty() {
+async fn public_client_all_accounts_empty() {
     let config = Configuration::builder("test-id").build();
     let app = msal::PublicClientApplication::new(config).unwrap();
-    let accounts = app.get_all_accounts().await.unwrap();
+    let accounts = app.all_accounts().await.unwrap();
     assert!(accounts.is_empty());
 }
 
@@ -559,7 +559,7 @@ async fn public_client_authorization_url() {
     let app = msal::PublicClientApplication::new(config).unwrap();
 
     let (url, pkce) = app
-        .get_authorization_url(
+        .authorization_url(
             vec!["user.read".into(), "mail.read".into()],
             "http://localhost:3000/redirect",
             Some("my-state"),
@@ -579,12 +579,12 @@ async fn public_client_authorization_url() {
 }
 
 #[tokio::test]
-async fn public_client_authorization_url_without_state() {
+async fn public_client_auth_url_without_state() {
     let config = Configuration::builder("test-id").build();
     let app = msal::PublicClientApplication::new(config).unwrap();
 
     let (url, _) = app
-        .get_authorization_url(vec!["user.read".into()], "http://localhost", None)
+        .authorization_url(vec!["user.read".into()], "http://localhost", None)
         .await
         .unwrap();
 

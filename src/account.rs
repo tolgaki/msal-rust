@@ -7,6 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default identity provider environment for Azure AD public cloud.
+pub const AAD_PUBLIC_CLOUD_ENVIRONMENT: &str = "login.microsoftonline.com";
+
 /// An authenticated user account.
 ///
 /// Returned by token acquisition methods and used for subsequent silent

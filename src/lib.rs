@@ -89,7 +89,6 @@
 //! | [`cache`] | In-memory token cache |
 //! | [`error`] | [`MsalError`] variants |
 //! | [`crypto`] | PKCE, nonce generation, JWT utilities |
-//! | [`network`] | HTTP client (internal) |
 
 pub mod account;
 pub mod authority;
@@ -99,7 +98,7 @@ pub mod client;
 pub mod config;
 pub mod crypto;
 pub mod error;
-pub mod network;
+pub(crate) mod network;
 pub mod request;
 pub mod response;
 

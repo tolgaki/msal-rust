@@ -31,7 +31,6 @@ use crate::broker::{AuthenticationScheme, BrokerSignOutRequest, BrokerTokenReque
 use crate::error::{MsalError, Result};
 use crate::response::AuthenticationResult;
 
-const AAD_AUTHORITY_HOST: &str = "https://login.microsoft.com";
 const AAD_PROVIDER_ID: &str = "https://login.microsoft.com";
 
 /// WAM-based native authentication broker for Windows.
@@ -135,7 +134,7 @@ impl WamBroker {
             AccountInfo {
                 home_account_id: id.clone(),
                 local_account_id: id,
-                environment: "login.microsoftonline.com".into(),
+                environment: crate::account::AAD_PUBLIC_CLOUD_ENVIRONMENT.into(),
                 tenant_id: String::new(),
                 username,
                 name: None,
@@ -302,7 +301,7 @@ impl NativeBroker for WamBroker {
         })
     }
 
-    fn get_all_accounts<'a>(
+    fn all_accounts<'a>(
         &'a self,
         client_id: &'a str,
         _correlation_id: &'a str,
@@ -344,7 +343,7 @@ impl NativeBroker for WamBroker {
                     result_accounts.push(AccountInfo {
                         home_account_id: id.clone(),
                         local_account_id: id,
-                        environment: "login.microsoftonline.com".into(),
+                        environment: crate::account::AAD_PUBLIC_CLOUD_ENVIRONMENT.into(),
                         tenant_id: String::new(),
                         username,
                         name: None,
@@ -357,7 +356,7 @@ impl NativeBroker for WamBroker {
         })
     }
 
-    fn get_account<'a>(
+    fn account<'a>(
         &'a self,
         account_id: &'a str,
         _correlation_id: &'a str,
@@ -380,7 +379,7 @@ impl NativeBroker for WamBroker {
             Ok(AccountInfo {
                 home_account_id: id.clone(),
                 local_account_id: id,
-                environment: "login.microsoftonline.com".into(),
+                environment: crate::account::AAD_PUBLIC_CLOUD_ENVIRONMENT.into(),
                 tenant_id: String::new(),
                 username,
                 name: None,

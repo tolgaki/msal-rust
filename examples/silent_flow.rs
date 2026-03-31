@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scopes = vec!["user.read".into()];
 
     // Check if we already have a cached account.
-    let accounts = app.get_all_accounts().await?;
+    let accounts = app.all_accounts().await?;
     let result = if let Some(account) = accounts.first() {
         // Try silent first.
         let silent_request = SilentFlowRequest {
