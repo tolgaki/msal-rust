@@ -49,6 +49,8 @@ objc2-foundation = { version = "0.3", optional = true, features = [
     "NSObject",
     "NSError",
     "NSValue",
+    "NSRunLoop",
+    "NSDate",
 ] }
 objc2-authentication-services = { version = "0.3", optional = true, features = [
     "ASAuthorizationSingleSignOnProvider",

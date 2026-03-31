@@ -8,8 +8,41 @@
 //!
 //! - macOS 13.0+ (Ventura)
 //! - Microsoft Intune Company Portal installed and MDM-configured
-//! - App entitlements must include the SSO extension's team ID (`UBF8T346G9`)
-//! - Redirect URI: `msauth.{bundle_id}://auth`
+//! - The SSO extension must be deployed via MDM profile
+//!
+//! # Redirect URI
+//!
+//! The redirect URI must be registered in your Entra ID app registration
+//! under the **iOS/macOS** platform:
+//!
+//! | App type | Redirect URI | Bundle ID |
+//! |----------|-------------|-----------|
+//! | `.app` bundle | `msauth.{bundle_id}://auth` | Your bundle ID |
+//! | **Unsigned CLI** | `msauth.com.msauth.unsignedapp://auth` | `com.msauth.unsignedapp` |
+//!
+//! **Important**: Signed-but-not-bundled executables (e.g., `codesign`-ed CLI
+//! binaries) are currently **blocked** by the broker. Either ship unsigned
+//! or wrap in a `.app` bundle.
+//!
+//! # CLI usage
+//!
+//! For CLI tools, use the convenience constructor [`MacOsBroker::new_for_cli`]
+//! which sets the correct unsigned-app redirect URI. Interactive broker flows
+//! require a running CFRunLoop on the main thread — call
+//! [`run_main_loop_until`] to pump AppKit events while waiting for the broker
+//! dialog.
+//!
+//! ```no_run
+//! # #[cfg(all(target_os = "macos", feature = "broker-macos"))]
+//! # fn example() -> Result<(), msal::MsalError> {
+//! use msal::broker::macos::MacOsBroker;
+//!
+//! let broker = MacOsBroker::new_for_cli(
+//!     "https://login.microsoftonline.com/your-tenant-id",
+//! )?;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Feature flag
 //!
@@ -23,7 +56,8 @@
 //! `ASAuthorizationController` must run on the main thread. This broker
 //! dispatches to the main thread internally via Grand Central Dispatch and
 //! bridges back to async via oneshot channels. Callers can `.await` from
-//! any thread.
+//! any thread. For interactive flows in CLI apps, the main thread must be
+//! running a CFRunLoop (see [`run_main_loop_until`]).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -49,6 +83,12 @@ use crate::response::AuthenticationResult;
 /// The identity provider URL for the Microsoft SSO extension.
 const MS_SSO_URL: &str = "https://login.microsoftonline.com/common";
 
+/// Redirect URI for unsigned CLI executables.
+///
+/// Register this in your Entra ID app registration under the iOS/macOS
+/// platform with bundle ID `com.msauth.unsignedapp`.
+pub const CLI_REDIRECT_URI: &str = "msauth.com.msauth.unsignedapp://auth";
+
 /// macOS Enterprise SSO broker.
 ///
 /// Uses Apple's `ASAuthorizationSingleSignOnProvider` to communicate with the
@@ -67,15 +107,11 @@ impl MacOsBroker {
     ///
     /// `redirect_uri` is required by the SSO extension to match the request
     /// to your Azure app registration. Use the format `msauth.{bundle_id}://auth`
-    /// (or `msauth.com.msauth.unsignedapp://auth` for unsigned executables).
+    /// for `.app` bundles, or [`CLI_REDIRECT_URI`] for unsigned CLI tools.
     ///
     /// `authority` is the Azure AD authority URL
     /// (e.g. `https://login.microsoftonline.com/common`).
-    ///
-    /// Should be called from the main thread for accurate availability detection.
     pub fn new(redirect_uri: impl Into<String>, authority: impl Into<String>) -> Result<Self> {
-        // Check availability. If not on main thread, conservatively assume available
-        // if we can at least parse the URL.
         let available = MainThreadMarker::new().map_or(true, |_mtm| {
             let ns_url_str = NSString::from_str(MS_SSO_URL);
             NSURL::URLWithString(&ns_url_str)
@@ -95,6 +131,19 @@ impl MacOsBroker {
         })
     }
 
+    /// Create a broker for an unsigned CLI tool.
+    ///
+    /// Uses the special `msauth.com.msauth.unsignedapp://auth` redirect URI
+    /// that the broker accepts for unsigned executables. You must register
+    /// this redirect URI in your Entra ID app registration under the
+    /// iOS/macOS platform with bundle ID `com.msauth.unsignedapp`.
+    ///
+    /// **Note**: Code-signed (but not `.app`-bundled) executables are currently
+    /// blocked by the broker. Ship the CLI unsigned or use ad-hoc signing only.
+    pub fn new_for_cli(authority: impl Into<String>) -> Result<Self> {
+        Self::new(CLI_REDIRECT_URI, authority)
+    }
+
     /// Execute an SSO request on the main thread, returning the result via oneshot.
     async fn perform_request(&self, params: SsoRequestParams) -> Result<AuthenticationResult> {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<AuthenticationResult>>();
@@ -103,8 +152,6 @@ impl MacOsBroker {
         dispatch2::DispatchQueue::main().exec_async(move || {
             let result = execute_sso_on_main_thread(params, tx);
             if let Err(e) = result {
-                // If setup failed before we could use tx, it was already consumed or
-                // we need to handle it. The error is logged but the channel may be gone.
                 eprintln!("msal: SSO setup error: {e}");
             }
         });
@@ -208,6 +255,37 @@ fn execute_sso_on_main_thread(
     std::mem::forget(delegate);
 
     Ok(())
+}
+
+/// Run the main thread's CFRunLoop until `done` returns `true`.
+///
+/// Interactive broker flows require AppKit event processing. In a CLI app,
+/// call this from the main thread after starting the broker request to pump
+/// events until the result arrives.
+///
+/// ```no_run
+/// # #[cfg(all(target_os = "macos", feature = "broker-macos"))]
+/// # fn example() {
+/// use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+/// use msal::broker::macos::run_main_loop_until;
+///
+/// let done = Arc::new(AtomicBool::new(false));
+/// let done2 = done.clone();
+///
+/// // Spawn async work that sets done=true when the broker responds...
+/// // Then pump the run loop on the main thread:
+/// run_main_loop_until(|| done2.load(Ordering::Relaxed));
+/// # }
+/// ```
+pub fn run_main_loop_until(done: impl Fn() -> bool) {
+    let run_loop = objc2_foundation::NSRunLoop::currentRunLoop();
+    let distant_future = objc2_foundation::NSDate::distantFuture();
+    while !done() {
+        run_loop.runMode_beforeDate(
+            unsafe { objc2_foundation::NSDefaultRunLoopMode },
+            &distant_future,
+        );
+    }
 }
 
 impl NativeBroker for MacOsBroker {
@@ -341,6 +419,7 @@ define_class!(
             // ASAuthorizationError codes:
             //   1000 = canceled, 1001 = failed, 1002 = invalidResponse,
             //   1003 = notHandled, 1004 = notInteractive
+            // Negative codes (e.g., -6000) come from the SSO extension itself.
             let err = if code == 1000 {
                 MsalError::UserCancelled
             } else if code == 1004 {

@@ -176,10 +176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(all(target_os = "macos", feature = "broker-macos"))]
     {
-        let broker = msal::broker::macos::MacOsBroker::new(
-            "msauth.com.example.myapp://auth",
+        // For CLI tools (unsigned binaries):
+        let broker = msal::broker::macos::MacOsBroker::new_for_cli(
             "https://login.microsoftonline.com/your-tenant-id",
         )?;
+        // For .app bundles, use MacOsBroker::new("msauth.{bundle_id}://auth", authority)
         app.set_broker(Box::new(broker)).await;
     }
 
