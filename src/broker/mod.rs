@@ -15,8 +15,8 @@
 //! let app = PublicClientApplication::new(config)?;
 //!
 //! // Enable brokered auth (platform-specific)
-//! #[cfg(target_os = "windows")]
-//! app.set_broker(Box::new(msal::broker::wam::WamBroker::new()?)).await;
+//! #[cfg(all(target_os = "windows", feature = "broker-wam"))]
+//! app.set_broker(Box::new(msal::broker::wam::WamBroker::new().await?)).await;
 //!
 //! let request = BrokerTokenRequest {
 //!     scopes: vec!["user.read".into()],

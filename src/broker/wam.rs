@@ -27,7 +27,7 @@ use windows::Security::Authentication::Web::Core::{
 use windows::Security::Credentials::WebAccountProvider;
 
 use crate::account::AccountInfo;
-use crate::broker::{AuthenticationScheme, BrokerSignOutRequest, BrokerTokenRequest, NativeBroker};
+use crate::broker::{BrokerSignOutRequest, BrokerTokenRequest, NativeBroker};
 use crate::error::{MsalError, Result};
 use crate::response::AuthenticationResult;
 
@@ -188,13 +188,13 @@ impl NativeBroker for WamBroker {
             .await
             .map_err(|e| MsalError::AuthenticationFailed(format!("WAM account not found: {e}")))?;
 
-            let result =
-                WebAuthenticationCoreManager::GetTokenSilentlyAsync(&wam_request, &web_account)
-                    .map_err(|e| MsalError::AuthenticationFailed(format!("WAM silent error: {e}")))?
-                    .await
-                    .map_err(|e| {
-                        MsalError::AuthenticationFailed(format!("WAM silent failed: {e}"))
-                    })?;
+            let result = WebAuthenticationCoreManager::GetTokenSilentlyWithWebAccountAsync(
+                &wam_request,
+                &web_account,
+            )
+            .map_err(|e| MsalError::AuthenticationFailed(format!("WAM silent error: {e}")))?
+            .await
+            .map_err(|e| MsalError::AuthenticationFailed(format!("WAM silent failed: {e}")))?;
 
             let response_status = result
                 .ResponseStatus()
@@ -307,7 +307,7 @@ impl NativeBroker for WamBroker {
         _correlation_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AccountInfo>>> + Send + 'a>> {
         Box::pin(async move {
-            let result = WebAuthenticationCoreManager::FindAllAccountsAsync(
+            let result = WebAuthenticationCoreManager::FindAllAccountsWithClientIdAsync(
                 &self.provider,
                 &HSTRING::from(client_id),
             )
@@ -317,12 +317,12 @@ impl NativeBroker for WamBroker {
                 MsalError::AuthenticationFailed(format!("WAM find accounts failed: {e}"))
             })?;
 
-            use windows::Security::Authentication::Web::Core::FindAllAccountsStatus;
+            use windows::Security::Authentication::Web::Core::FindAllWebAccountsStatus;
             let status = result.Status().map_err(|e| {
                 MsalError::AuthenticationFailed(format!("WAM accounts status error: {e}"))
             })?;
 
-            if status != FindAllAccountsStatus::Success {
+            if status != FindAllWebAccountsStatus::Success {
                 return Err(MsalError::AuthenticationFailed(
                     "WAM failed to enumerate accounts".into(),
                 ));
