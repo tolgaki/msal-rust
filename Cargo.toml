@@ -14,7 +14,7 @@ categories = ["authentication", "web-programming"]
 
 [features]
 default = []
-broker-wam = ["windows"]
+broker-wam = ["dep:windows", "dep:windows-future"]
 broker-macos = [
     "objc2",
     "objc2-foundation",
@@ -68,12 +68,13 @@ block2 = { version = "0.6", optional = true }
 dispatch2 = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", optional = true, features = [
+windows = { version = "0.62", optional = true, features = [
     "Foundation",
     "Foundation_Collections",
     "Security_Authentication_Web_Core",
     "Security_Credentials",
 ] }
+windows-future = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
