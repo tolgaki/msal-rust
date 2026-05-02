@@ -54,7 +54,7 @@ impl PublicClientApplication {
     /// # let config = Configuration::builder("id").build();
     /// let app = PublicClientApplication::new(config)?;
     ///
-    /// #[cfg(target_os = "windows")]
+    /// #[cfg(all(target_os = "windows", feature = "broker-wam"))]
     /// {
     ///     let broker = msal::broker::wam::WamBroker::new().await?;
     ///     app.set_broker(Box::new(broker)).await;
