@@ -2,7 +2,7 @@
 name = "msal"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 description = "Microsoft Authentication Library (MSAL) for Rust — authenticate with Azure AD, Microsoft accounts, and Azure AD B2C"
 license = "MIT"
 readme = "README.md"
