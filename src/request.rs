@@ -16,8 +16,160 @@
 //!     scopes: vec!["user.read".into()],
 //!     claims: None,
 //!     correlation_id: None,
+//!     extra_query_parameters: Default::default(),
+//!     cancellation_token: None,
 //! };
 //! ```
+
+use crate::error::{MsalError, Result};
+use std::collections::BTreeMap;
+
+/// Cloneable cooperative cancellation for HTTP and device polling.
+///
+/// Cancelling drops the in-flight HTTP future. It does not revoke tokens, cancel
+/// a server-side device session, or imply that detached native UI was closed.
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    sender: tokio::sync::watch::Sender<bool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(false);
+        Self { sender }
+    }
+
+    pub fn cancel(&self) {
+        self.sender.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    pub fn check_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(MsalError::OperationCancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn cancelled(&self) {
+        let mut receiver = self.sender.subscribe();
+        receiver
+            .wait_for(|cancelled| *cancelled)
+            .await
+            .expect("sender retained by token");
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reject extra parameters that could override library-owned OAuth/security fields.
+///
+/// `client_session` is deliberately allowed as an opaque server parameter.
+/// Transmission does not prove that a particular server enforces session binding.
+pub fn validate_extra_query_parameters(parameters: &BTreeMap<String, String>) -> Result<()> {
+    const RESERVED: &[&str] = &[
+        "client_id",
+        "client_secret",
+        "client_assertion",
+        "client_assertion_type",
+        "grant_type",
+        "code",
+        "code_verifier",
+        "code_challenge",
+        "code_challenge_method",
+        "redirect_uri",
+        "response_type",
+        "response_mode",
+        "scope",
+        "claims",
+        "nonce",
+        "state",
+        "refresh_token",
+        "device_code",
+        "username",
+        "password",
+        "assertion",
+        "requested_token_use",
+        "client_info",
+        "client-request-id",
+        "return-client-request-id",
+        "authority",
+        "account_id",
+        "tenant_id",
+        "force_refresh",
+        "token_type",
+        "req_cnf",
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for (key, value) in parameters {
+        if key.is_empty()
+            || key.trim() != key
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            || RESERVED.contains(&key.to_ascii_lowercase().as_str())
+            || value.trim().is_empty()
+            || !seen.insert(key.to_ascii_lowercase())
+        {
+            return Err(MsalError::InvalidConfiguration(format!(
+                "invalid or reserved extra parameter: {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_claims(claims: &Option<String>) -> Result<()> {
+    if let Some(claims) = claims {
+        if !serde_json::from_str::<serde_json::Value>(claims)?.is_object() {
+            return Err(MsalError::InvalidConfiguration(
+                "claims must be a JSON object".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn append_request_parameters<'a>(
+    params: &mut Vec<(&'a str, &'a str)>,
+    claims: &'a Option<String>,
+    correlation_id: &'a Option<String>,
+    extra: &'a BTreeMap<String, String>,
+) -> Result<()> {
+    validate_extra_query_parameters(extra)?;
+    validate_claims(claims)?;
+    if let Some(claims) = claims {
+        params.push(("claims", claims));
+    }
+    if let Some(id) = correlation_id {
+        params.push(("client-request-id", id));
+        params.push(("return-client-request-id", "true"));
+    }
+    params.extend(
+        extra
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    Ok(())
+}
+
+pub(crate) fn user_scopes(scopes: &[String]) -> Vec<String> {
+    let mut scopes = scopes.to_vec();
+    for scope in ["openid", "profile", "offline_access"] {
+        if !scopes.iter().any(|existing| existing == scope) {
+            scopes.push(scope.into());
+        }
+    }
+    scopes
+}
 
 /// Parameters for the authorization code exchange.
 ///
@@ -37,6 +189,11 @@ pub struct AuthorizationCodeRequest {
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+    /// Nonce returned by `authorization_url_with_options`, checked on the ID token.
+    pub nonce: Option<String>,
+    /// Additional server parameters; cannot override OAuth-owned fields.
+    pub extra_query_parameters: BTreeMap<String, String>,
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl AuthorizationCodeRequest {
@@ -49,6 +206,9 @@ impl AuthorizationCodeRequest {
             code_verifier: None,
             claims: None,
             correlation_id: None,
+            nonce: None,
+            extra_query_parameters: BTreeMap::new(),
+            cancellation_token: None,
         }
     }
 }
@@ -64,6 +224,8 @@ pub struct ClientCredentialRequest {
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+    pub extra_query_parameters: BTreeMap<String, String>,
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl ClientCredentialRequest {
@@ -73,6 +235,8 @@ impl ClientCredentialRequest {
             scopes,
             claims: None,
             correlation_id: None,
+            extra_query_parameters: BTreeMap::new(),
+            cancellation_token: None,
         }
     }
 }
@@ -88,6 +252,8 @@ pub struct DeviceCodeRequest {
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+    pub extra_query_parameters: BTreeMap<String, String>,
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl DeviceCodeRequest {
@@ -97,6 +263,8 @@ impl DeviceCodeRequest {
             scopes,
             claims: None,
             correlation_id: None,
+            extra_query_parameters: BTreeMap::new(),
+            cancellation_token: None,
         }
     }
 }
@@ -117,6 +285,8 @@ pub struct SilentFlowRequest {
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+    pub extra_query_parameters: BTreeMap<String, String>,
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl SilentFlowRequest {
@@ -128,6 +298,8 @@ impl SilentFlowRequest {
             force_refresh: false,
             claims: None,
             correlation_id: None,
+            extra_query_parameters: BTreeMap::new(),
+            cancellation_token: None,
         }
     }
 }
@@ -145,6 +317,14 @@ pub struct RefreshTokenRequest {
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+    /// Previously authenticated identity associated with this refresh token.
+    ///
+    /// Only supply trusted protected-cache state, never identity guessed from a
+    /// username or an access token. Without it, identity-less refresh results
+    /// have `account: None` and cannot be cached as a user.
+    pub account: Option<crate::account::AccountInfo>,
+    pub extra_query_parameters: BTreeMap<String, String>,
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl RefreshTokenRequest {
@@ -155,6 +335,9 @@ impl RefreshTokenRequest {
             scopes,
             claims: None,
             correlation_id: None,
+            account: None,
+            extra_query_parameters: BTreeMap::new(),
+            cancellation_token: None,
         }
     }
 }
@@ -172,6 +355,8 @@ pub struct OnBehalfOfRequest {
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+    pub extra_query_parameters: BTreeMap<String, String>,
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl OnBehalfOfRequest {
@@ -182,6 +367,8 @@ impl OnBehalfOfRequest {
             scopes,
             claims: None,
             correlation_id: None,
+            extra_query_parameters: BTreeMap::new(),
+            cancellation_token: None,
         }
     }
 }
@@ -204,6 +391,8 @@ pub struct UsernamePasswordRequest {
     pub claims: Option<String>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
+    pub extra_query_parameters: BTreeMap<String, String>,
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl UsernamePasswordRequest {
@@ -215,6 +404,8 @@ impl UsernamePasswordRequest {
             scopes,
             claims: None,
             correlation_id: None,
+            extra_query_parameters: BTreeMap::new(),
+            cancellation_token: None,
         }
     }
 }

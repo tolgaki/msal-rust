@@ -123,7 +123,10 @@ fn confidential_client_construction_with_secret() {
 #[test]
 fn account_cache_key() {
     let account = test_account();
-    assert_eq!(account.cache_key(), "uid.utid-login.microsoftonline.com");
+    assert_eq!(
+        account.cache_key(),
+        r#"["uid.utid","login.microsoftonline.com","tenant-id","oid"]"#
+    );
 }
 
 #[test]
@@ -469,6 +472,10 @@ fn broker_token_request_construction() {
             resource_request_uri: "https://graph.microsoft.com/v1.0/me".into(),
             shr_nonce: None,
         }),
+        force_refresh: false,
+        authority: None,
+        extra_query_parameters: Default::default(),
+        cancellation_token: None,
     };
 
     assert_eq!(request.scopes, vec!["user.read"]);
@@ -509,6 +516,10 @@ async fn public_client_interactive_without_broker_errors() {
         window_handle: None,
         authentication_scheme: Default::default(),
         pop_params: None,
+        force_refresh: false,
+        authority: None,
+        extra_query_parameters: Default::default(),
+        cancellation_token: None,
     };
 
     let result = app.acquire_token_interactive(request).await;
@@ -530,6 +541,8 @@ async fn public_client_silent_without_cache_errors() {
         force_refresh: false,
         claims: None,
         correlation_id: None,
+        extra_query_parameters: Default::default(),
+        cancellation_token: None,
     };
 
     let result = app.acquire_token_silent(request).await;
@@ -633,6 +646,9 @@ fn request_types_are_clone_and_debug() {
         code_verifier: Some("verifier".into()),
         claims: None,
         correlation_id: None,
+        nonce: None,
+        extra_query_parameters: Default::default(),
+        cancellation_token: None,
     };
     let cloned = req.clone();
     assert_eq!(format!("{:?}", req), format!("{:?}", cloned));

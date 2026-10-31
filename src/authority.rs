@@ -75,6 +75,7 @@ impl Authority {
         let url = Url::parse(authority_url)
             .map_err(|e| MsalError::AuthorityValidation(format!("invalid authority URL: {e}")))?;
 
+        Self::validate_authority_url(&url)?;
         let authority_type = detect_authority_type(&url);
         let tenant = extract_tenant(&url);
 
@@ -120,6 +121,7 @@ impl Authority {
     pub fn from_url_no_discovery(authority_url: &str) -> Result<Self> {
         let url = Url::parse(authority_url)
             .map_err(|e| MsalError::AuthorityValidation(format!("invalid authority URL: {e}")))?;
+        Self::validate_authority_url(&url)?;
 
         let authority_type = detect_authority_type(&url);
         let tenant = extract_tenant(&url);
@@ -132,8 +134,25 @@ impl Authority {
             authorization_endpoint: format!("{base}/oauth2/v2.0/authorize"),
             token_endpoint: format!("{base}/oauth2/v2.0/token"),
             device_code_endpoint: format!("{base}/oauth2/v2.0/devicecode"),
-            issuer: format!("https://login.microsoftonline.com/{tenant}/v2.0"),
+            issuer: format!("{base}/v2.0"),
         })
+    }
+
+    pub(crate) fn validate_authority_url(url: &Url) -> Result<()> {
+        let loopback = matches!(
+            url.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        );
+        if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.host_str().is_none()
+        {
+            return Err(MsalError::AuthorityValidation("authority must be HTTPS without credentials, query or fragment (HTTP loopback is test/development only)".into()));
+        }
+        Ok(())
     }
 }
 

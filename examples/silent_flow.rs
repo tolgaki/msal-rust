@@ -7,7 +7,7 @@
 //! Run with: `cargo run --example silent_flow`
 
 use msal::request::{DeviceCodeRequest, SilentFlowRequest};
-use msal::{Configuration, MsalError, PublicClientApplication};
+use msal::{Configuration, PublicClientApplication};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,15 +29,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Got token silently (from cache or refresh)");
                 result
             }
-            Err(MsalError::InteractionRequired(_)) => {
+            Err(error) if error.is_interaction_required() => {
                 println!("Silent failed, falling back to device code...");
-                acquire_interactively(&app, &scopes).await?
+                acquire_interactively(&app, &scopes, error.claims()).await?
             }
             Err(e) => return Err(e.into()),
         }
     } else {
         println!("No cached accounts, authenticating...");
-        acquire_interactively(&app, &scopes).await?
+        acquire_interactively(&app, &scopes, None).await?
     };
 
     println!(
@@ -54,15 +54,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn acquire_interactively(
     app: &PublicClientApplication,
     scopes: &[String],
-) -> Result<msal::AuthenticationResult, MsalError> {
+    claims: Option<&str>,
+) -> Result<msal::AuthenticationResult, Box<dyn std::error::Error>> {
     let request = DeviceCodeRequest {
         scopes: scopes.to_vec(),
-        claims: None,
+        claims: claims.map(String::from),
         correlation_id: None,
+        extra_query_parameters: Default::default(),
+        cancellation_token: None,
     };
 
-    app.acquire_token_by_device_code(request, |info| {
-        println!("\n{}\n", info.message);
-    })
-    .await
+    Ok(app
+        .acquire_token_by_device_code(request, |info| {
+            println!("\n{}\n", info.message);
+        })
+        .await?)
 }

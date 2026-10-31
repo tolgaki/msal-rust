@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- All OAuth requests accept validated extra server parameters and cooperative
+  cancellation. `client_session` is transmitted without claiming live server
+  enforcement; claims and challenge metadata are preserved without silent retry.
+- Device/login requests obtain `client_info` and OIDC scopes. Refresh preserves
+  trusted prior identity when realistic responses omit ID tokens or rotation.
+  Account, resource tenant, environment, audience, issuer and nonce mismatches
+  fail explicitly instead of silently yielding incomplete cached identities.
+- Public authorization-code requests require the original PKCE verifier and
+  nonce. `PkceParams` now retains the generated nonce.
+- Cache keys include the complete account, tenant, environment and claims/EQP
+  context. Atomic, client-bound serde snapshots support caller-owned protected
+  persistence without creating secret files.
+- Broker requests expose authority, force-refresh, EQP and cancellation.
+  Unsupported native guarantees fail explicitly; macOS enumeration/sign-out no
+  longer report false success. Native runtime behavior remains platform-specific.
+- ID-token parsing documents the direct TLS/native provenance boundary, not a
+  blanket public-client local-signature requirement or arbitrary-JWT validator.
+
+These request-field additions and complete-identity cache keys are source/API
+changes; prefer constructors and update explicit struct literals. No main-branch
+or consumer integration changes are included.
+
 ## [0.1.0] - 2026-03-30
 
 ### Added

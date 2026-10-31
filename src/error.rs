@@ -32,6 +32,24 @@ pub enum MsalError {
     #[error("interaction required: {0}")]
     InteractionRequired(String),
 
+    /// Interaction is required, with the original OAuth challenge preserved.
+    #[error("interaction required [{error}]: {description}")]
+    InteractionRequiredWithClaims {
+        error: String,
+        description: String,
+        correlation_id: Option<String>,
+        claims: Option<String>,
+        suberror: Option<String>,
+    },
+
+    /// The requested guarantee is not supported by this implementation/platform.
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+
+    /// The caller cancelled the operation, not necessarily the server-side session.
+    #[error("operation cancelled")]
+    OperationCancelled,
+
     /// The user cancelled the authentication prompt (broker flows).
     #[error("user cancelled the authentication flow")]
     UserCancelled,
@@ -121,6 +139,10 @@ pub enum MsalError {
     #[error("device code authorization pending")]
     AuthorizationPending,
 
+    /// Device polling must increase its interval by five seconds (RFC 8628).
+    #[error("device code polling must slow down")]
+    SlowDown,
+
     // ── Crypto / Serialization ──────────────────────────────────────────
     /// A cryptographic operation failed.
     #[error("crypto error: {0}")]
@@ -141,3 +163,22 @@ pub enum MsalError {
 
 /// A convenience type alias for `Result<T, MsalError>`.
 pub type Result<T> = std::result::Result<T, MsalError>;
+
+impl MsalError {
+    /// Whether an OAuth or local error requires an interactive authentication flow.
+    pub fn is_interaction_required(&self) -> bool {
+        matches!(
+            self,
+            Self::InteractionRequired(_) | Self::InteractionRequiredWithClaims { .. }
+        )
+    }
+
+    /// The original server claims challenge, without parsing or rewriting it.
+    pub fn claims(&self) -> Option<&str> {
+        match self {
+            Self::InteractionRequiredWithClaims { claims, .. }
+            | Self::ServerError { claims, .. } => claims.as_deref(),
+            _ => None,
+        }
+    }
+}

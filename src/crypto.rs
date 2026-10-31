@@ -29,6 +29,8 @@ pub struct PkceParams {
     pub challenge: String,
     /// The challenge method (always `"S256"`).
     pub challenge_method: &'static str,
+    /// Authorization nonce. Copy it to `AuthorizationCodeRequest::nonce`.
+    pub nonce: String,
 }
 
 impl PkceParams {
@@ -40,6 +42,7 @@ impl PkceParams {
             verifier,
             challenge,
             challenge_method: "S256",
+            nonce: generate_nonce(),
         }
     }
 }
@@ -75,9 +78,10 @@ fn base64_url_encode_sha256(input: &[u8]) -> String {
 
 /// Decode a JWT payload without signature verification.
 ///
-/// This is used internally to extract claims from ID tokens returned by the
-/// token endpoint. Signature verification is not performed because the token
-/// was received over a direct HTTPS channel from the authority.
+/// This function is only a decoder, not an authenticator. Its input has no
+/// trusted provenance and its output must never establish identity by itself.
+/// Acquisition methods separately check direct endpoint/native provenance and
+/// flow-appropriate audience, issuer, time, nonce and account consistency.
 pub fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
