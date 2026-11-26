@@ -169,7 +169,7 @@ impl ConfidentialClientApplication {
             .cache
             .refresh_with_context(&request.account, &context)?
         {
-            let scope_str = request.scopes.join(" ");
+            let scope_str = crate::request::user_scopes(&request.scopes).join(" ");
             let mut params = vec![
                 ("client_id", self.state.config.auth.client_id.as_str()),
                 ("grant_type", "refresh_token"),

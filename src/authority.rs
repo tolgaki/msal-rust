@@ -174,27 +174,25 @@ impl Authority {
     }
 }
 
-/// Hosts that Entra ID treats as the same public-cloud environment.
-const PUBLIC_CLOUD_ALIASES: &[&str] = &[
-    "login.microsoftonline.com",
-    "login.windows.net",
-    "login.microsoft.com",
-    "sts.windows.net",
+/// Host groups that Entra ID treats as one cloud environment. The first host
+/// of each group is its canonical (preferred) environment.
+const CLOUD_ALIAS_GROUPS: &[&[&str]] = &[
+    &[
+        "login.microsoftonline.com",
+        "login.windows.net",
+        "login.microsoft.com",
+        "sts.windows.net",
+    ],
+    &["login.partner.microsoftonline.cn", "login.chinacloudapi.cn"],
+    &["login.microsoftonline.us", "login.usgovcloudapi.net"],
 ];
-
-pub(crate) fn is_public_cloud_alias(host: &str) -> bool {
-    PUBLIC_CLOUD_ALIASES
-        .iter()
-        .any(|alias| alias.eq_ignore_ascii_case(host))
-}
 
 /// Canonical, lowercase environment for cache keys and account identity.
 pub(crate) fn canonical_environment(host: &str) -> String {
-    if is_public_cloud_alias(host) {
-        crate::account::AAD_PUBLIC_CLOUD_ENVIRONMENT.into()
-    } else {
-        host.to_ascii_lowercase()
-    }
+    CLOUD_ALIAS_GROUPS
+        .iter()
+        .find(|group| group.iter().any(|alias| alias.eq_ignore_ascii_case(host)))
+        .map_or_else(|| host.to_ascii_lowercase(), |group| group[0].to_string())
 }
 
 /// Whether two environments name the same cloud (case-insensitive, alias-aware).
@@ -203,14 +201,20 @@ pub(crate) fn environments_equivalent(left: &str, right: &str) -> bool {
 }
 
 fn detect_authority_type(url: &Url) -> AuthorityType {
-    let host = url.host_str().unwrap_or_default();
-    let path = url.path();
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    // Match the first path segment exactly: substring matching would classify
+    // e.g. `/adfscorp.onmicrosoft.com` as ADFS and skip tenant checks.
+    let first_segment = url
+        .path_segments()
+        .and_then(|mut segments| segments.next())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
-    if host.contains(".b2clogin.com") || path.contains("/tfp/") {
+    if host.ends_with(".b2clogin.com") || first_segment == "tfp" {
         AuthorityType::AadB2C
-    } else if host.contains(".ciamlogin.com") {
+    } else if host.ends_with(".ciamlogin.com") {
         AuthorityType::Ciam
-    } else if path.contains("/adfs") {
+    } else if first_segment == "adfs" {
         AuthorityType::Adfs
     } else {
         AuthorityType::Aad

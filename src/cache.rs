@@ -108,10 +108,31 @@ pub(crate) struct CacheContext {
     refresh: String,
 }
 
+/// Extra parameters that only steer the sign-in UI or account picker. They do
+/// not change what a token represents, so they never partition the cache.
+fn is_ui_hint_parameter(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "login_hint"
+            | "domain_hint"
+            | "prompt"
+            | "ui_locales"
+            | "display"
+            | "max_age"
+            | "msafed"
+            | "instance_aware"
+            | "sid"
+    )
+}
+
 pub(crate) fn request_context(
     claims: &Option<String>,
     extra: &std::collections::BTreeMap<String, String>,
 ) -> CacheContext {
+    let extra: std::collections::BTreeMap<&String, &String> = extra
+        .iter()
+        .filter(|(key, _)| !is_ui_hint_parameter(key))
+        .collect();
     let encode = |claims: &Option<String>| {
         if claims.is_none() && extra.is_empty() {
             String::new()
@@ -161,6 +182,10 @@ fn insert_result(
         return Ok(());
     }
     let account_key = account.cache_key();
+    // Refresh tokens live only in the refresh partition; keeping them in
+    // access-token entries would export superseded refresh tokens.
+    let mut access = result.clone();
+    access.refresh_token = None;
     state.access_tokens.insert(
         AccessTokenKey {
             account: account_key.clone(),
@@ -168,7 +193,7 @@ fn insert_result(
             context: context.into(),
         },
         CachedToken {
-            result: result.clone(),
+            result: access,
             context: context.into(),
         },
     );
@@ -302,15 +327,42 @@ impl TokenCache {
         self.try_all_accounts().unwrap_or_default()
     }
 
-    /// Atomically remove only this complete identity, not other guest tenants.
+    /// Atomically remove this account in this tenant and environment, but not
+    /// the same user's other (guest) tenants.
+    ///
+    /// Matching ignores `local_account_id`, so an `AccountInfo` built from a
+    /// different local identifier (e.g. `sub` instead of `oid`) still removes it.
     pub fn remove_account(&self, account: &AccountInfo) -> Result<()> {
-        let key = account.cache_key();
+        let matches = |other: &AccountInfo| {
+            other.home_account_id == account.home_account_id
+                && other.tenant_id.eq_ignore_ascii_case(&account.tenant_id)
+                && crate::authority::environments_equivalent(
+                    &other.environment,
+                    &account.environment,
+                )
+        };
         let mut state = self.state.write().map_err(|_| lock_error())?;
-        state.accounts.remove(&key);
-        state.access_tokens.retain(|entry, _| entry.account != key);
+        let mut keys: std::collections::HashSet<String> = state
+            .accounts
+            .iter()
+            .filter(|(_, other)| matches(other))
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.extend(
+            state
+                .refresh_tokens
+                .values()
+                .filter(|entry| matches(&entry.account))
+                .map(|entry| entry.account.cache_key()),
+        );
+        keys.insert(account.cache_key());
+        state.accounts.retain(|key, _| !keys.contains(key));
+        state
+            .access_tokens
+            .retain(|entry, _| !keys.contains(&entry.account));
         state
             .refresh_tokens
-            .retain(|(account, _), _| account != &key);
+            .retain(|(account, _), _| !keys.contains(account));
         Ok(())
     }
 

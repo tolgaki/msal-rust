@@ -40,6 +40,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellation are cached. `sign_out` no longer requires the account to match
   the current authority.
 
+- Authority types are detected from the first path segment (`adfs`, `tfp`) or
+  host suffix, not substrings. China and US Government host aliases are
+  equivalent within their cloud; issuer ports must be 443; B2C accepts the
+  legacy `tfp` issuer form.
+- `invalid_grant` is classified as interaction required unless its suberror is
+  `client_mismatch` or `protection_policy_required`.
+- UI hint parameters (`login_hint`, `domain_hint`, `prompt`, ...) no longer
+  partition the cache. Snapshot access-token entries carry no refresh tokens.
+  `remove_account` removes every local spelling of the account in that tenant.
+- Silent refreshes request the OIDC scopes. Silent calls fall back to the
+  cached refresh token when the broker reports `Unsupported`; `sign_out`
+  clears the local cache before calling the broker. Broker requests add the
+  OIDC scopes, accept domain-name tenant authorities, and the macOS adapter
+  rejects responses without `expires_in`.
+
+### Breaking
+
+- Server `interaction_required`, `consent_required`, `login_required` and
+  `invalid_grant` errors are now `MsalError::InteractionRequiredWithClaims`
+  rather than `InteractionRequired`/`ServerError`; match with
+  `MsalError::is_interaction_required()`. `MsalError` gained the variants
+  `InteractionRequiredWithClaims`, `Unsupported`, `OperationCancelled` and
+  `SlowDown`, which breaks exhaustive matches.
+
 These request-field additions and complete-identity cache keys are source/API
 changes; prefer constructors and update explicit struct literals. No main-branch
 or consumer integration changes are included.

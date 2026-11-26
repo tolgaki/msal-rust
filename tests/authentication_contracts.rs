@@ -449,6 +449,30 @@ async fn expired_refresh_is_not_misclassified_as_device_expiration() {
         .expect(1)
         .mount(&server)
         .await;
+    // An expired refresh token needs interactive sign-in, not a device-code
+    // expiration and not an opaque server error.
+    let error = app(&server)
+        .acquire_token_by_refresh_token(RefreshTokenRequest::new(
+            "refresh".into(),
+            vec!["user.read".into()],
+        ))
+        .await
+        .unwrap_err();
+    assert!(error.is_interaction_required(), "{error:?}");
+}
+
+#[tokio::test]
+async fn invalid_grant_suberrors_without_ui_remedy_stay_server_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(token_path()))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error":"invalid_grant", "error_description":"wrong client",
+            "suberror":"client_mismatch"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
     assert!(matches!(
         app(&server)
             .acquire_token_by_refresh_token(RefreshTokenRequest::new(
@@ -948,4 +972,248 @@ async fn sign_out_removes_accounts_that_no_longer_match_the_authority() {
     let mut foreign = account("login.microsoftonline.us");
     foreign.tenant_id = OTHER_TENANT.into();
     application.sign_out(&foreign).await.unwrap();
+}
+
+#[tokio::test]
+async fn login_with_domain_hint_is_reusable_by_plain_silent_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(token_path()))
+        .and(form_field("domain_hint", "contoso.com"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(user_response(id_claims())))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let application = app(&server);
+    let mut request = RefreshTokenRequest::new("refresh".into(), vec!["user.read".into()]);
+    request
+        .extra_query_parameters
+        .insert("domain_hint".into(), "contoso.com".into());
+    let identity = application
+        .acquire_token_by_refresh_token(request)
+        .await
+        .unwrap()
+        .account
+        .unwrap();
+    assert_eq!(
+        application
+            .acquire_token_silent(SilentFlowRequest::new(vec!["user.read".into()], identity))
+            .await
+            .unwrap()
+            .access_token,
+        "access"
+    );
+}
+
+#[test]
+fn remove_account_ignores_local_id_spelling_but_keeps_guest_tenants() {
+    let cache = TokenCache::new();
+    let home = account("login.microsoftonline.com");
+    let mut guest = home.clone();
+    guest.tenant_id = OTHER_TENANT.into();
+    cache.save(&result(&home)).unwrap();
+    cache.save(&result(&guest)).unwrap();
+    let mut by_subject = home.clone();
+    by_subject.local_account_id = "subject-instead-of-oid".into();
+    by_subject.environment = "login.windows.net".into();
+    cache.remove_account(&by_subject).unwrap();
+    assert!(cache.lookup_refresh_token(&home).is_none());
+    assert_eq!(cache.all_accounts(), vec![guest]);
+}
+
+#[test]
+fn snapshot_access_entries_do_not_carry_refresh_tokens() {
+    let cache = TokenCache::new();
+    cache
+        .save(&result(&account("login.microsoftonline.com")))
+        .unwrap();
+    let snapshot = serde_json::to_value(cache.export().unwrap()).unwrap();
+    assert!(snapshot["tokens"][0]["result"]["refresh_token"].is_null());
+    assert_eq!(snapshot["refresh_tokens"][0]["token"], "refresh");
+}
+
+#[tokio::test]
+async fn sign_out_clears_local_cache_even_when_broker_sign_out_fails() {
+    struct FailingSignOut;
+    impl msal::broker::NativeBroker for FailingSignOut {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn acquire_token_silent<'a>(
+            &'a self,
+            client_id: &'a str,
+            request: &'a msal::broker::BrokerTokenRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = msal::error::Result<AuthenticationResult>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            StrictBroker.acquire_token_silent(client_id, request)
+        }
+        fn acquire_token_interactive<'a>(
+            &'a self,
+            client_id: &'a str,
+            request: &'a msal::broker::BrokerTokenRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = msal::error::Result<AuthenticationResult>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            StrictBroker.acquire_token_interactive(client_id, request)
+        }
+        fn sign_out<'a>(
+            &'a self,
+            _client_id: &'a str,
+            _request: &'a msal::broker::BrokerSignOutRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = msal::error::Result<()>> + Send + 'a>>
+        {
+            Box::pin(async { Err(MsalError::Unsupported("sign-out".into())) })
+        }
+        fn all_accounts<'a>(
+            &'a self,
+            client_id: &'a str,
+            correlation_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = msal::error::Result<Vec<AccountInfo>>> + Send + 'a,
+            >,
+        > {
+            StrictBroker.all_accounts(client_id, correlation_id)
+        }
+        fn account<'a>(
+            &'a self,
+            account_id: &'a str,
+            correlation_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = msal::error::Result<AccountInfo>> + Send + 'a>,
+        > {
+            StrictBroker.account(account_id, correlation_id)
+        }
+    }
+    let application = PublicClientApplication::new(
+        Configuration::builder("client")
+            .authority(format!("https://login.microsoftonline.com/{TENANT}"))
+            .build(),
+    )
+    .unwrap();
+    let identity = account("login.microsoftonline.com");
+    let mut snapshot = serde_json::to_value(application.export_cache().unwrap()).unwrap();
+    let mut saved = result(&identity);
+    saved.refresh_token = None;
+    snapshot["tokens"] = serde_json::json!([{ "result": saved, "context": "" }]);
+    application
+        .import_cache(serde_json::from_value(snapshot).unwrap())
+        .unwrap();
+    application.set_broker(Box::new(FailingSignOut)).await;
+    assert!(application.sign_out(&identity).await.is_err());
+    let remaining = serde_json::to_value(application.export_cache().unwrap()).unwrap();
+    assert_eq!(remaining["tokens"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn silent_falls_back_to_refresh_token_when_broker_cannot_serve_account() {
+    let server = MockServer::start().await;
+    let application = app(&server);
+    let identity = account("127.0.0.1");
+    let mut request = RefreshTokenRequest::new("initial".into(), vec!["user.read".into()]);
+    request.account = Some(identity.clone());
+    Mock::given(method("POST"))
+        .and(path(token_path()))
+        .and(form_field("refresh_token", "initial"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token":"first", "expires_in":3600, "refresh_token":"cached"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    application
+        .acquire_token_by_refresh_token(request)
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path(token_path()))
+        .and(form_field("refresh_token", "cached"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token":"refreshed", "expires_in":3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // A broker that cannot serve this account (no native mapping) reports
+    // Unsupported; silent must continue with the cached refresh token.
+    struct UnsupportedSilent;
+    impl msal::broker::NativeBroker for UnsupportedSilent {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn acquire_token_silent<'a>(
+            &'a self,
+            _client_id: &'a str,
+            _request: &'a msal::broker::BrokerTokenRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = msal::error::Result<AuthenticationResult>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Err(MsalError::Unsupported("no native mapping".into())) })
+        }
+        fn acquire_token_interactive<'a>(
+            &'a self,
+            client_id: &'a str,
+            request: &'a msal::broker::BrokerTokenRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = msal::error::Result<AuthenticationResult>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            StrictBroker.acquire_token_interactive(client_id, request)
+        }
+        fn sign_out<'a>(
+            &'a self,
+            client_id: &'a str,
+            request: &'a msal::broker::BrokerSignOutRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = msal::error::Result<()>> + Send + 'a>>
+        {
+            StrictBroker.sign_out(client_id, request)
+        }
+        fn all_accounts<'a>(
+            &'a self,
+            client_id: &'a str,
+            correlation_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = msal::error::Result<Vec<AccountInfo>>> + Send + 'a,
+            >,
+        > {
+            StrictBroker.all_accounts(client_id, correlation_id)
+        }
+        fn account<'a>(
+            &'a self,
+            account_id: &'a str,
+            correlation_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = msal::error::Result<AccountInfo>> + Send + 'a>,
+        > {
+            StrictBroker.account(account_id, correlation_id)
+        }
+    }
+    application.set_broker(Box::new(UnsupportedSilent)).await;
+    let mut silent = SilentFlowRequest::new(vec!["user.read".into()], identity);
+    silent.force_refresh = true;
+    assert_eq!(
+        application
+            .acquire_token_silent(silent)
+            .await
+            .unwrap()
+            .access_token,
+        "refreshed"
+    );
 }

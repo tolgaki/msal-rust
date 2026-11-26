@@ -86,7 +86,7 @@ impl WamBroker {
         let properties = request_properties(params, &self.authority)?;
         let request = WebTokenRequest::CreateWithPromptType(
             &self.provider,
-            &HSTRING::from(params.scopes.join(" ")),
+            &HSTRING::from(crate::request::user_scopes(&params.scopes).join(" ")),
             &HSTRING::from(client_id),
             WebTokenRequestPromptType::Default,
         )
@@ -387,7 +387,11 @@ fn request_properties(
         let tenant = authority.path().trim_matches('/');
         if matches!(tenant, "common" | "organizations" | "consumers") {
             authority.set_path(&format!("/{}", account.tenant_id));
-        } else if !tenant.eq_ignore_ascii_case(&account.tenant_id) {
+        } else if uuid::Uuid::parse_str(tenant).is_ok()
+            && !tenant.eq_ignore_ascii_case(&account.tenant_id)
+        {
+            // A domain-name tenant cannot be compared with the account's tenant
+            // GUID here; the client validates the returned tenant.
             return Err(MsalError::InvalidConfiguration(
                 "selected account resource tenant differs from WAM authority".into(),
             ));

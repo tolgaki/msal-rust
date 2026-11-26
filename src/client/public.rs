@@ -178,19 +178,28 @@ impl PublicClientApplication {
                         // its result instead.
                         cancellation_token: None,
                     };
-                    let result = crate::network::cancellable(
+                    let outcome = crate::network::cancellable(
                         request.cancellation_token.as_ref(),
                         broker.acquire_token_silent(
                             &self.state.config.auth.client_id,
                             &broker_request,
                         ),
                     )
-                    .await?;
-                    self.validate_broker_result(&result, Some(&request.account))?;
-                    if self.state.config.cache.store_in_memory {
-                        self.state.cache.save_with_context(&result, &context)?;
+                    .await;
+                    match outcome {
+                        // The broker cannot serve this request (e.g. an account it
+                        // has no native mapping for, or an unsupported option):
+                        // continue with the locally cached refresh token.
+                        Err(MsalError::Unsupported(_)) => {}
+                        outcome => {
+                            let result = outcome?;
+                            self.validate_broker_result(&result, Some(&request.account))?;
+                            if self.state.config.cache.store_in_memory {
+                                self.state.cache.save_with_context(&result, &context)?;
+                            }
+                            return Ok(result);
+                        }
                     }
-                    return Ok(result);
                 }
             }
         }
@@ -201,7 +210,9 @@ impl PublicClientApplication {
             .cache
             .refresh_with_context(&request.account, &context)?
         {
-            let scope_str = request.scopes.join(" ");
+            // Include OIDC scopes so the refresh rotates the refresh token
+            // and returns an ID token that re-validates the account.
+            let scope_str = crate::request::user_scopes(&request.scopes).join(" ");
             let params = [
                 ("client_id", self.state.config.auth.client_id.as_str()),
                 ("grant_type", "refresh_token"),
@@ -237,24 +248,22 @@ impl PublicClientApplication {
         // Only require a complete identity: removing local state for an account
         // whose environment/tenant no longer matches the authority must still work.
         account.validate()?;
-        // Try broker sign-out first.
-        {
-            let b = self.broker.read().await;
-            if let Some(ref broker) = *b {
-                if broker.is_available() {
-                    let sign_out_request = BrokerSignOutRequest {
-                        account: account.clone(),
-                        correlation_id: None,
-                    };
-                    broker
-                        .sign_out(&self.state.config.auth.client_id, &sign_out_request)
-                        .await?;
-                }
+        // Clear local state first, so a failing or unsupported broker sign-out
+        // can never leave cached tokens behind for this account.
+        self.state.cache.remove_account(account)?;
+        let b = self.broker.read().await;
+        if let Some(ref broker) = *b {
+            if broker.is_available() {
+                let sign_out_request = BrokerSignOutRequest {
+                    account: account.clone(),
+                    correlation_id: None,
+                };
+                broker
+                    .sign_out(&self.state.config.auth.client_id, &sign_out_request)
+                    .await?;
             }
         }
-
-        // Clear local cache.
-        self.state.cache.remove_account(account)
+        Ok(())
     }
 
     /// Return all accounts. If a broker is configured, returns broker accounts;

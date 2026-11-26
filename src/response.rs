@@ -283,6 +283,7 @@ pub(crate) fn validate_endpoint_id_token(
     let issuer_error =
         || MsalError::InvalidToken("ID token issuer differs from authority/tenant".into());
     if issuer.scheme() != "https"
+        || issuer.port_or_known_default() != Some(443)
         || !issuer.username().is_empty()
         || issuer.password().is_some()
         || issuer.query().is_some()
@@ -325,8 +326,22 @@ pub(crate) fn validate_endpoint_id_token(
             tid.to_string()
         }
         AuthorityType::AadB2C => {
-            // B2C issuers are `https://{host}/{tenant-id}/v2.0/`, without the policy.
-            let issuer_tenant = v2_issuer_tenant().ok_or_else(issuer_error)?;
+            // B2C issuers are `https://{host}/{tenant-id}/v2.0/`, without the
+            // policy, or the legacy `https://{host}/tfp/{tenant-id}/{policy}/v2.0/`.
+            let tfp_issuer_tenant = || -> Option<&str> {
+                let mut segments = issuer.path_segments()?.filter(|s| !s.is_empty());
+                let (tfp, tenant, _policy, version) = (
+                    segments.next()?,
+                    segments.next()?,
+                    segments.next()?,
+                    segments.next()?,
+                );
+                (tfp.eq_ignore_ascii_case("tfp") && version == "v2.0" && segments.next().is_none())
+                    .then_some(tenant)
+            };
+            let issuer_tenant = v2_issuer_tenant()
+                .or_else(tfp_issuer_tenant)
+                .ok_or_else(issuer_error)?;
             if !issuer_host.eq_ignore_ascii_case(authority_host)
                 || tid.is_some_and(|tid| !tid.eq_ignore_ascii_case(issuer_tenant))
             {
@@ -416,6 +431,38 @@ mod tests {
             claims(&format!("https://other.b2clogin.com/{TENANT}/v2.0/"))
         )
         .is_err());
+    }
+
+    #[test]
+    fn sovereign_cloud_aliases_and_issuer_port() {
+        let china = format!("https://login.partner.microsoftonline.cn/{TENANT}/v2.0");
+        assert!(check("https://login.chinacloudapi.cn/common", claims(&china)).is_ok());
+        let gov = format!("https://login.microsoftonline.us/{TENANT}/v2.0");
+        assert!(check("https://login.usgovcloudapi.net/common", claims(&gov)).is_ok());
+        assert!(check("https://login.chinacloudapi.cn/common", claims(&gov)).is_err());
+        let port = format!("https://login.microsoftonline.com:8443/{TENANT}/v2.0");
+        assert!(check("https://login.microsoftonline.com/common", claims(&port)).is_err());
+    }
+
+    #[test]
+    fn adfs_detection_requires_adfs_path_segment() {
+        // A tenant domain starting with "adfs" is an Entra tenant, not ADFS:
+        // an ADFS-style issuer without `tid` must not be accepted for it.
+        let authority = "https://login.microsoftonline.com/adfscorp.onmicrosoft.com";
+        let mut adfs_like = claims("https://login.microsoftonline.com/adfs");
+        adfs_like.as_object_mut().unwrap().remove("tid");
+        assert!(check(authority, adfs_like).is_err());
+        let issuer = format!("https://login.microsoftonline.com/{TENANT}/v2.0");
+        assert_eq!(check(authority, claims(&issuer)).unwrap(), TENANT);
+    }
+
+    #[test]
+    fn b2c_accepts_legacy_tfp_issuer() {
+        let authority = "https://contoso.b2clogin.com/tfp/contoso.onmicrosoft.com/B2C_1_signin";
+        let issuer = format!("https://contoso.b2clogin.com/tfp/{TENANT}/B2C_1_signin/v2.0/");
+        let mut value = claims(&issuer);
+        value.as_object_mut().unwrap().remove("tid");
+        assert_eq!(check(authority, value).unwrap(), TENANT);
     }
 
     #[test]

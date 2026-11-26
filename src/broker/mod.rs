@@ -299,7 +299,10 @@ fn account_from_native_response(
         || !(host == issuer_host || (public_alias(host) && public_alias(issuer_host)))
         || !matches!(issuer.path(), path if path == format!("/{tid}/") || path == format!("/{tid}/v2.0"))
         || !(matches!(tenant, "common" | "organizations" | "consumers")
-            || tenant.eq_ignore_ascii_case(tid))
+            || tenant.eq_ignore_ascii_case(tid)
+            // Domain-name tenants (contoso.onmicrosoft.com) name the tenant
+            // that issued `tid`; only GUID tenants can be compared directly.
+            || uuid::Uuid::parse_str(tenant).is_err())
     {
         return Err(invalid());
     }
@@ -378,6 +381,35 @@ mod tests {
             claims[field] = value.into();
             assert!(native_account(claims).is_err());
         }
+    }
+
+    #[test]
+    fn domain_name_tenant_authority_accepts_its_tenant_guid() {
+        let tid = "11111111-1111-4111-8111-111111111111";
+        let mut value = claims();
+        value["tid"] = tid.into();
+        value["iss"] = format!("https://login.microsoftonline.com/{tid}/v2.0").into();
+        let jwt = format!(
+            "e30.{}.native",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap())
+        );
+        let info = URL_SAFE_NO_PAD.encode(br#"{"uid":"home-user","utid":"home-tenant"}"#);
+        let account = account_from_native_response(
+            "client",
+            "https://login.microsoftonline.com/contoso.onmicrosoft.com",
+            &jwt,
+            &info,
+        )
+        .unwrap();
+        assert_eq!(account.tenant_id, tid);
+        // A different GUID tenant is still rejected.
+        assert!(account_from_native_response(
+            "client",
+            "https://login.microsoftonline.com/22222222-2222-4222-8222-222222222222",
+            &jwt,
+            &info,
+        )
+        .is_err());
     }
 
     #[test]

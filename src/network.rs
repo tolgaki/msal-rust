@@ -76,17 +76,14 @@ pub async fn post_token_request(
         if error == "interaction_required"
             || error == "consent_required"
             || error == "login_required"
+            // As in MSAL, invalid_grant (expired/revoked refresh token, password
+            // change, wrong ROPC credentials, ...) means the user must sign in
+            // again, except for suberrors that no interaction can resolve.
             || (error == "invalid_grant"
-                && (claims.is_some()
-                    || matches!(
-                        suberror.as_deref(),
-                        Some(
-                            "basic_action"
-                                | "additional_action"
-                                | "consent_required"
-                                | "message_only"
-                        )
-                    )))
+                && !matches!(
+                    suberror.as_deref(),
+                    Some("client_mismatch" | "protection_policy_required")
+                ))
         {
             return Err(MsalError::InteractionRequiredWithClaims {
                 error,

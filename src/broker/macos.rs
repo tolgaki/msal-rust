@@ -248,7 +248,11 @@ impl SsoRequestParams {
                 let mut tenanted_authority = authority.clone();
                 tenanted_authority.set_path(&format!("/{}", account.tenant_id));
                 query.insert("authority".into(), tenanted_authority.into());
-            } else if !tenant.eq_ignore_ascii_case(&account.tenant_id) {
+            } else if uuid::Uuid::parse_str(tenant).is_ok()
+                && !tenant.eq_ignore_ascii_case(&account.tenant_id)
+            {
+                // A domain-name tenant cannot be compared with the account's
+                // tenant GUID here; the client validates the returned tenant.
                 return Err(MsalError::InvalidConfiguration(
                     "selected account resource tenant differs from SSO authority".into(),
                 ));
@@ -434,7 +438,7 @@ impl NativeBroker for MacOsBroker {
                     .authority
                     .clone()
                     .unwrap_or_else(|| self.authority.clone()),
-                scopes: request.scopes.join(" "),
+                scopes: crate::request::user_scopes(&request.scopes).join(" "),
                 operation: "refresh".to_string(),
                 interactive: false,
                 account: Some(account.clone()),
@@ -471,7 +475,7 @@ impl NativeBroker for MacOsBroker {
                     .authority
                     .clone()
                     .unwrap_or_else(|| self.authority.clone()),
-                scopes: request.scopes.join(" "),
+                scopes: crate::request::user_scopes(&request.scopes).join(" "),
                 operation: "login".to_string(),
                 interactive: true,
                 account: request.account.clone(),
@@ -757,7 +761,11 @@ fn parse_token_body(
         .as_str()
         .and_then(|s| s.parse().ok())
         .or_else(|| body["expires_in"].as_i64())
-        .unwrap_or(3600);
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            // Assuming a lifetime would let the local cache serve an expired token.
+            MsalError::AuthenticationFailed("missing or invalid expires_in in SSO response".into())
+        })?;
 
     let scopes: Vec<String> = body["scope"]
         .as_str()
@@ -893,6 +901,7 @@ mod tests {
         });
         let body = serde_json::json!({
             "access_token": "native-token",
+            "expires_in": 3600,
             "id_token": format!("e30.{}.native", URL_SAFE_NO_PAD.encode(
                 serde_json::to_vec(&claims).unwrap(),
             )),
