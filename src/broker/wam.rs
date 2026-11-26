@@ -89,13 +89,15 @@ impl WamBroker {
             })
             .collect();
         accounts.sort_by_key(|entry| entry.account.cache_key());
-        Ok(WamAccountSnapshot {
+        let snapshot = WamAccountSnapshot {
             version: 1,
             client_id: client_id.into(),
             authority: self.authority.clone(),
             provider_id: AAD_PROVIDER_ID.into(),
             accounts,
-        })
+        };
+        validate_snapshot(client_id, &self.authority, snapshot.clone())?;
+        Ok(snapshot)
     }
 
     /// Atomically replace this client's associations from integrity-protected data.
@@ -465,6 +467,12 @@ fn validate_snapshot(
             "WAM snapshot version/client/provider/authority mismatch".into(),
         ));
     }
+    validate_authority(authority)?;
+    let authority_url = url::Url::parse(authority)
+        .map_err(|_| MsalError::InvalidConfiguration("invalid snapshot authority".into()))?;
+    let authority_host = authority_url
+        .host_str()
+        .ok_or_else(|| MsalError::InvalidConfiguration("missing snapshot authority host".into()))?;
     let mut replacement = AccountAssociations::new();
     for entry in snapshot.accounts {
         validate_account_identity(&entry.account)?;
@@ -473,21 +481,13 @@ fn validate_snapshot(
                 "WAM snapshot native ID is empty".into(),
             ));
         }
-        // Reuse the routing checks: resource tenant and cloud must match.
-        let request = BrokerTokenRequest {
-            scopes: Vec::new(),
-            account: Some(entry.account.clone()),
-            claims: None,
-            force_refresh: false,
-            authority: None,
-            extra_query_parameters: Default::default(),
-            cancellation_token: None,
-            correlation_id: None,
-            window_handle: None,
-            authentication_scheme: Default::default(),
-            pop_params: None,
-        };
-        request_properties(&request, authority)?;
+        // A response acquired with an explicit tenant override still belongs
+        // to this broker. Preserve its resource tenant, not the default realm.
+        if !crate::authority::environments_equivalent(authority_host, &entry.account.environment) {
+            return Err(MsalError::InvalidConfiguration(
+                "WAM snapshot account environment differs from broker authority".into(),
+            ));
+        }
         if replacement
             .insert(
                 (client_id.into(), entry.account.cache_key()),
@@ -948,6 +948,31 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_preserves_explicit_resource_tenant_override_without_changing_default_routing() {
+        let default_authority =
+            "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111";
+        let resource_authority =
+            "https://login.microsoftonline.com/22222222-2222-4222-8222-222222222222";
+        let mut snapshot = snapshot();
+        snapshot.authority = default_authority.into();
+        snapshot.accounts[0].account.tenant_id = "22222222-2222-4222-8222-222222222222".into();
+        let account = snapshot.accounts[0].account.clone();
+        let restored = validate_snapshot("client", default_authority, snapshot).unwrap();
+        assert_eq!(
+            mapped_account_id(&restored, "client", &account).unwrap(),
+            "opaque-native-id"
+        );
+        let mut request = request();
+        request.account = Some(account);
+        assert!(request_properties(&request, default_authority).is_err());
+        request.authority = Some(resource_authority.into());
+        assert_eq!(
+            request_properties(&request, default_authority).unwrap()["authority"],
+            resource_authority
+        );
     }
 
     #[test]

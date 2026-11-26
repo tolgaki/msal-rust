@@ -333,9 +333,13 @@ async WamBroker::account_for_client(&self, client_id: &str, account: &AccountInf
 `native_account_id: String` and `account: AccountInfo`, preserving home/local
 IDs, resource tenant, environment and display metadata. Import validates version
 1, exact client/provider/configured-authority binding, complete identity,
-authority routing and duplicate identities **before** replacing this client's
+cloud binding and duplicate identities **before** replacing this client's
 state under one lock. Failure leaves previous state unchanged. Multiple resource
-identities may legitimately share one native ID. Lookup checks native existence;
+identities may legitimately share one native ID. Accounts acquired using an
+explicit resource-tenant override can round-trip even when the configured default
+authority is a different GUID tenant; restoration preserves that tenant rather
+than rewriting it. Acquisition still requires the matching explicit authority
+override when the default authority names another tenant. Lookup checks native existence;
 subsequent token responses still check the complete selected identity.
 
 The snapshot contains identity metadata, not tokens. It is not encrypted and
