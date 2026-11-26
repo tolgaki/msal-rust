@@ -306,34 +306,132 @@ these Windows checks; do not treat an inferred endpoint pattern as verification.
 | Extra parameters including `client_session` | Each validated key/value becomes a `WebTokenRequest.Properties` property | WWW-form-encoded map in `extra_query_param`, not invented top-level extension options |
 | Force refresh | `Unsupported` before dispatch: no verified raw-WAM bypass property | `force_refresh="1"` (or `"0"`) per native serializer; runtime-unverified here |
 | Selected account | `RequestTokenWithWebAccountAsync`, plus complete returned-identity checks | `home_account_id` plus complete returned-identity checks |
-| Cancellation token | Already cancelled: `OperationCancelled`; otherwise `Unsupported` before dispatch | Same: no claim that detached UI is cancelled |
-| Enumeration/sign-out | Only client-specific verified account associations; sign-out via `SignOutWithClientIdAsync` | Both explicitly `Unsupported`, not empty enumeration or no-op success |
+| Cancellation token | `IAsyncInfo::Cancel`, then await terminal completion; cancellation failure surfaces, no UI-dismissal promise | Already cancelled: `OperationCancelled`; otherwise `Unsupported` before dispatch |
+| Enumeration/sign-out | `FindAllAccountsWithClientIdAsync` plus restored/verified associations; sign-out via `SignOutWithClientIdAsync` | Unentitled CLI: typed `get_accounts_operation`; entitled enumeration and client-only native sign-out: `Unsupported` |
 
 WAM associations map complete identity to the opaque native account ID **in this
-broker instance and client only**. They are established by a successfully
-identity-validated native response. Cold selected-account/silent requests or
+broker and client only**, shared by `WamBroker::clone()`. They are established
+by a successfully identity-validated native response or restored from trusted,
+integrity-protected consumer state. Cold selected-account/silent requests or
 enumerations containing an unassociated account fail closed; a username, home
 tenant or opaque WAM ID is not used to guess the missing resource identity.
 `NativeBroker::account(home_id)` is unsupported because a home ID alone cannot
 select client/resource-tenant context. Restoring OAuth cache snapshots does not
-restore these native associations. WAM force-refresh and explicit HWND parenting
-remain unsupported in this raw adapter.
+restore these native associations automatically.
+
+The Windows public APIs are:
+
+```text
+WamBroker::export_account_associations(&self, client_id: &str) -> Result<WamAccountSnapshot>
+WamBroker::import_account_associations(&self, client_id: &str, snapshot: WamAccountSnapshot) -> Result<()>
+async WamBroker::account_for_client(&self, client_id: &str, account: &AccountInfo) -> Result<AccountInfo>
+```
+
+`WamAccountSnapshot` is serde-compatible with fields `version: u32`,
+`client_id`, `authority`, `provider_id` (strings), and
+`accounts: Vec<WamAccountAssociation>`. Each association has
+`native_account_id: String` and `account: AccountInfo`, preserving home/local
+IDs, resource tenant, environment and display metadata. Import validates version
+1, exact client/provider/configured-authority binding, complete identity,
+authority routing and duplicate identities **before** replacing this client's
+state under one lock. Failure leaves previous state unchanged. Multiple resource
+identities may legitimately share one native ID. Lookup checks native existence;
+subsequent token responses still check the complete selected identity.
+
+The snapshot contains identity metadata, not tokens. It is not encrypted and
+structural validation is **not authentication of imported state**. Use the
+consumer's existing protected store with integrity and client/authority binding;
+this library creates no credential files. Keep a clone before moving the broker
+into `app.set_broker(Box::new(broker))`, then export that shared handle after
+successful acquisition and sign-out. Persist association deletion together with
+the consumer's own sign-out transaction; importing stale protected state does not
+undo native sign-out or prove a native account is still usable.
+
+Raw WAM force-refresh and explicit HWND parenting remain unsupported. Current
+[MSAL.NET RuntimeBroker](https://github.com/AzureAD/microsoft-authentication-library-for-dotnet/blob/3d50649ef8551ea2f88a8426cc25cda84df8e5b2/src/client/Microsoft.Identity.Client.Broker/RuntimeBroker.cs)
+implements `ForceRefresh` by first obtaining an access token, setting native
+`AuthParameters.AccessTokenToRenew`, and acquiring again through MSALRuntime.
+That is not a documented `WebTokenRequest.Properties` field; the pinned raw
+WAM adapter below has no equivalent bypass contract. `ForceAuthentication`
+is a prompt type, not proof of bypassing the native access-token cache. This
+port therefore rejects raw-WAM force refresh rather than inventing a property.
+
+`NativeBroker::supports_native_cancellation() -> bool` defaults to false; WAM
+returns true. Public silent acquisition forwards cancellation to capable native
+adapters and does not drop their futures at an outer wait-only cancellation
+boundary. Legacy silent adapters retain wait-only cancellation. WAM cancels the
+account lookup/token `IAsyncOperation`, retains it until completion and discards
+a result racing cancellation. A failed `Cancel` or unexpected terminal native
+error is surfaced. [WinRT cancellation is cooperative](https://learn.microsoft.com/en-us/windows/uwp/threading-async/cancel-an-async-operation):
+neither a successful call nor `OperationCancelled` proves UI dismissal, server
+rollback or token revocation. Dropping an acquisition future without using its
+cancellation token does not promise native cancellation.
+
+macOS `new_for_cli` account operations use protocol 4 and signed-in-only
+enumeration. `accounts` is a JSON array encoded inside a string response header,
+not token data. The adapter checks operation response type/success and rejects
+missing or partial identity instead of guessing the resource tenant from home
+ID. It uses native `home_account_id`, `local_account_id`, `realm` and
+`environment`; display username never selects the account. Its exact lookup is
+`async MacOsBroker::account_for_client(&self, client_id: &str, account: &AccountInfo,
+correlation_id: &str) -> Result<AccountInfo>`.
+
+macOS native sign-out remains `Unsupported`, before dispatch.
+The official `signout_account_operation` exposes `signout_from_browser`,
+`clear_sso_extension_cookies`, `wipe_account` and `wipe_cache_all_accounts`.
+[Microsoft warns that `wipeAccount` is destructive shared-cache removal](https://azuread.github.io/microsoft-authentication-library-for-objc/Classes/MSALSignoutParameters.html),
+not isolated client sign-out. Neither setting all those flags to zero nor
+accepting a generic success acknowledgement proves native client state was
+removed. The current `BrokerSignOutRequest` does not express consent to those
+broader effects; this adapter will not turn local cache deletion into claimed
+native sign-out or dispatch a device/shared-cache wipe as a shortcut.
+`MacOsBroker::new(...)` does not enable typed enumeration: Microsoft's
+base operation serializer requires a broker key for entitled apps; the official
+macOS unentitled runtime path permits omission. This adapter implements only
+that omission path with `new_for_cli`, not a new keychain/broker-key store.
+Installed extension versions can reject it, and native errors propagate.
 
 macOS authorization dispatch still needs the real main thread/run loop.
 `run_main_loop_until(done)` processes the default mode in finite 50ms iterations
 and checks the predicate again; this is **not an authentication timeout or UI
 cancellation API**. Invoke it on the main thread while the Tokio future executes
-elsewhere, as in the platform's existing lifecycle example. The native
+elsewhere. The native
 controller/delegate survives until its callback, including when an awaiting
-future is dropped. macOS compilation/runtime and installed extension behavior
-are not verified on Windows. A cross-target check was attempted, but `ring`
-requires a Darwin C toolchain unavailable on this host.
+future is dropped. Construct `MacOsBroker::new_for_cli(authority)` on the actual
+main thread **before** creating async work. Do not put construction inside
+`#[tokio::main]` worker work or block the main thread on `block_on`/`join` before
+pumping callbacks.
+
+`examples/broker_macos_cli.rs` is a runnable lifecycle example. On an unsigned,
+unentitled macOS CLI with Company Portal/MDM SSO configured and the unsigned-app
+redirect registered, set `MSAL_CLIENT_ID` and `MSAL_AUTHORITY`, then run:
+
+```text
+cargo run --example broker_macos_cli --features broker-macos
+```
+
+It constructs the broker on main, moves acquisition to a Tokio runtime on a
+worker thread and pumps main until that worker completes. No token is printed.
+The main-loop polling deadline is not an auth timeout. Both
+`x86_64-apple-darwin` and `aarch64-apple-darwin` checks were attempted on Windows
+(the missing Intel standard-library target was installed); both stop in `ring`
+because this host lacks a Darwin C compiler/SDK. Offline portable Apple
+account-protocol tests are not macOS adapter compilation or runtime verification.
+No live authentication, keychain, device-registration or tenant mutation was
+performed to test these changes.
 
 Mappings were checked against pinned official source:
 [MSAL.NET WamAdapters](https://github.com/AzureAD/microsoft-authentication-library-for-dotnet/blob/0661b34a41255bfdd7980663572be0544578117e/src/client/Microsoft.Identity.Client/Platforms/Features/WamBroker/WamAdapters.cs),
 [AadPlugin](https://github.com/AzureAD/microsoft-authentication-library-for-dotnet/blob/0661b34a41255bfdd7980663572be0544578117e/src/client/Microsoft.Identity.Client/Platforms/Features/WamBroker/AadPlugin.cs),
 and Microsoft's
 [MSIDBrokerOperationTokenRequest](https://github.com/AzureAD/microsoft-authentication-library-common-for-objc/blob/33e84282e0ac6f075421dd1f7c989e1384fad59d/IdentityCore/src/broker_operation/request/token_request/MSIDBrokerOperationTokenRequest.m).
+Typed Apple operations were checked at the same revision:
+[get-accounts request](https://github.com/AzureAD/microsoft-authentication-library-common-for-objc/blob/33e84282e0ac6f075421dd1f7c989e1384fad59d/IdentityCore/src/broker_operation/request/account_request/MSIDBrokerOperationGetAccountsRequest.m),
+[get-accounts response](https://github.com/AzureAD/microsoft-authentication-library-common-for-objc/blob/33e84282e0ac6f075421dd1f7c989e1384fad59d/IdentityCore/src/broker_operation/response/MSIDBrokerOperationGetAccountsResponse.m),
+[account metadata](https://github.com/AzureAD/microsoft-authentication-library-common-for-objc/blob/33e84282e0ac6f075421dd1f7c989e1384fad59d/IdentityCore/src/oauth2/account/MSIDAccount.m),
+[sign-out request](https://github.com/AzureAD/microsoft-authentication-library-common-for-objc/blob/33e84282e0ac6f075421dd1f7c989e1384fad59d/IdentityCore/src/broker_operation/request/account_request/MSIDBrokerOperationSignoutFromDeviceRequest.m),
+[broker-key requirement](https://github.com/AzureAD/microsoft-authentication-library-common-for-objc/blob/33e84282e0ac6f075421dd1f7c989e1384fad59d/IdentityCore/src/broker_operation/request/MSIDBrokerOperationRequest.m),
+and [response-header transport](https://github.com/AzureAD/microsoft-authentication-library-common-for-objc/blob/33e84282e0ac6f075421dd1f7c989e1384fad59d/IdentityCore/src/requests/broker/MSIDSSOExtensionRequestDelegate.m).
 Offline mapping tests and Windows compilation do not establish live eSTS
 session enforcement, device binding or cross-tenant broker correctness.
 

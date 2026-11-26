@@ -43,6 +43,9 @@ pub mod macos;
 #[cfg(all(target_os = "windows", feature = "broker-wam"))]
 pub mod wam;
 
+#[cfg(any(test, all(target_os = "macos", feature = "broker-macos")))]
+mod macos_protocol;
+
 use std::future::Future;
 use std::pin::Pin;
 
@@ -86,8 +89,10 @@ pub struct BrokerTokenRequest {
     pub authority: Option<String>,
     /// Additional server query parameters, mapped only through supported native APIs.
     pub extra_query_parameters: std::collections::BTreeMap<String, String>,
-    /// Cancellation of the native operation, not merely of the awaiting future.
-    /// Adapters without native cancellation reject an uncancelled token before dispatch.
+    /// Requests cancellation of the native operation, not merely the awaiting future.
+    /// WAM calls `IAsyncInfo::Cancel` and waits for native completion; this does
+    /// not guarantee UI dismissal or revoke already-issued tokens. Adapters
+    /// without native cancellation reject an uncancelled token before dispatch.
     pub cancellation_token: Option<crate::request::CancellationToken>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
@@ -124,6 +129,13 @@ pub struct BrokerSignOutRequest {
 pub trait NativeBroker: Send + Sync {
     /// Returns `true` if the broker is available on this platform.
     fn is_available(&self) -> bool;
+
+    /// Whether token acquisition accepts and dispatches native cancellation.
+    /// False preserves wait-only cancellation for legacy silent adapters.
+    /// True does not promise native UI dismissal or server-side rollback.
+    fn supports_native_cancellation(&self) -> bool {
+        false
+    }
 
     /// Acquire a token silently (no user prompts).
     ///
@@ -168,18 +180,25 @@ pub trait NativeBroker: Send + Sync {
 }
 
 /// Shared preflight for adapters that cannot guarantee in-flight native cancellation.
+#[cfg(any(test, all(target_os = "macos", feature = "broker-macos")))]
+fn validate_request(request: &BrokerTokenRequest) -> Result<()> {
+    validate_request_options(request, false)
+}
+
 #[cfg(any(
     test,
     all(target_os = "windows", feature = "broker-wam"),
     all(target_os = "macos", feature = "broker-macos")
 ))]
-fn validate_request(request: &BrokerTokenRequest) -> Result<()> {
+fn validate_request_options(request: &BrokerTokenRequest, native_cancellation: bool) -> Result<()> {
     if let Some(token) = &request.cancellation_token {
         token.check_cancelled()?;
-        return Err(crate::error::MsalError::Unsupported(
-            "this native adapter cannot cancel an in-flight broker operation; omit cancellation_token"
-                .into(),
-        ));
+        if !native_cancellation {
+            return Err(crate::error::MsalError::Unsupported(
+                "this native adapter cannot cancel an in-flight broker operation; omit cancellation_token"
+                    .into(),
+            ));
+        }
     }
     crate::request::validate_extra_query_parameters(&request.extra_query_parameters)?;
     if request.authentication_scheme != AuthenticationScheme::Bearer || request.pop_params.is_some()

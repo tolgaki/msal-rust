@@ -39,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --features broker-wam
+      - run: cargo test --features broker-wam
 
   test-macos-broker:
     name: Test (macOS broker)
@@ -47,8 +47,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --features broker-macos
+      - run: cargo test --features broker-macos
+      - run: cargo check --all-targets --target x86_64-apple-darwin --features broker-macos
+      - run: cargo check --all-targets --target aarch64-apple-darwin --features broker-macos
 
   fmt:
     name: Format

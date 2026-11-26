@@ -182,20 +182,25 @@ impl PublicClientApplication {
                         force_refresh: request.force_refresh,
                         authority: Some(self.state.config.auth.authority.clone()),
                         extra_query_parameters: request.extra_query_parameters.clone(),
-                        // Native adapters cannot cancel an in-flight operation and
-                        // reject requests carrying a token. A silent native call shows
-                        // no UI, so cancellation here stops waiting for it and discards
-                        // its result instead.
-                        cancellation_token: None,
+                        cancellation_token: if broker.supports_native_cancellation() {
+                            request.cancellation_token.clone()
+                        } else {
+                            None
+                        },
                     };
-                    let outcome = crate::network::cancellable(
-                        request.cancellation_token.as_ref(),
-                        broker.acquire_token_silent(
-                            &self.state.config.auth.client_id,
-                            &broker_request,
-                        ),
-                    )
-                    .await;
+                    let acquisition = broker
+                        .acquire_token_silent(&self.state.config.auth.client_id, &broker_request);
+                    // Native cancellation must reach Cancel and native completion,
+                    // rather than dropping the adapter future at the outer layer.
+                    let outcome = if broker.supports_native_cancellation() {
+                        acquisition.await
+                    } else {
+                        crate::network::cancellable(
+                            request.cancellation_token.as_ref(),
+                            acquisition,
+                        )
+                        .await
+                    };
                     match outcome {
                         // The broker cannot serve this request (e.g. an account it
                         // has no native mapping for, or an unsupported option):

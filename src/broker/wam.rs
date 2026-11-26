@@ -5,30 +5,34 @@
 //!
 //! This is the raw AAD WAM provider, not MSALRuntime. Its compatibility
 //! properties follow Microsoft's MSAL.NET 4.30.1 `AadPlugin`/`WamAdapters`.
-//! Force-refresh and in-flight cancellation are not exposed by this adapter
-//! and fail before native dispatch. Desktop HWND interop is not implemented.
+//! Force-refresh fails before dispatch; MSALRuntime's AccessTokenToRenew is
+//! not a raw-WAM property. Cancellation calls IAsyncInfo::Cancel and waits for
+//! native completion, without guaranteeing UI dismissal. HWND interop is absent.
 //!
 //! WAM account IDs are opaque and must not be treated as MSAL home IDs.
-//! Verified associations are retained for this broker instance and client.
+//! Verified associations can be exported/imported using the caller's protected store.
 //! Cold account enumeration/selection requiring unresolved guest identities
 //! returns `Unsupported` rather than guessing or acquiring tokens as a side effect.
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::future::IntoFuture;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use windows::core::HSTRING;
+use serde::{Deserialize, Serialize};
+use windows::core::{RuntimeType, HSTRING};
 use windows::Security::Authentication::Web::Core::{
     FindAllWebAccountsStatus, WebAuthenticationCoreManager, WebTokenRequest,
     WebTokenRequestPromptType, WebTokenRequestResult, WebTokenRequestStatus, WebTokenResponse,
 };
 use windows::Security::Credentials::{WebAccount, WebAccountProvider};
+use windows_future::{AsyncStatus, IAsyncOperation};
 
 use crate::account::AccountInfo;
 use crate::broker::{
-    account_from_native_response, same_account, validate_account_identity, validate_request,
-    BrokerSignOutRequest, BrokerTokenRequest, NativeBroker,
+    account_from_native_response, same_account, validate_account_identity,
+    validate_request_options, BrokerSignOutRequest, BrokerTokenRequest, NativeBroker,
 };
 use crate::error::{MsalError, Result};
 use crate::response::AuthenticationResult;
@@ -38,15 +42,101 @@ const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com/common";
 
 type AccountAssociations = HashMap<(String, String), (String, AccountInfo)>;
 
+/// Plaintext identity associations, not tokens or a protected storage format.
+/// Import only data authenticated by the consumer's existing protected store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WamAccountSnapshot {
+    pub version: u32,
+    pub client_id: String,
+    pub authority: String,
+    pub provider_id: String,
+    pub accounts: Vec<WamAccountAssociation>,
+}
+
+/// A token-response-validated complete identity and its opaque WAM account ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WamAccountAssociation {
+    pub native_account_id: String,
+    pub account: AccountInfo,
+}
+
 /// WAM-based native authentication broker for Windows.
+#[derive(Clone)]
 pub struct WamBroker {
     provider: WebAccountProvider,
     authority: String,
     /// Client + complete MSAL identity -> native ID, authenticated by a token response.
-    accounts: Mutex<AccountAssociations>,
+    accounts: Arc<Mutex<AccountAssociations>>,
 }
 
 impl WamBroker {
+    /// Export this client's associations for the caller's protected persistence.
+    /// No refresh/access tokens are exported. Save again after acquisition/sign-out.
+    pub fn export_account_associations(&self, client_id: &str) -> Result<WamAccountSnapshot> {
+        validate_client_id(client_id)?;
+        let known = self
+            .accounts
+            .lock()
+            .map_err(|_| MsalError::AuthenticationFailed("WAM account map poisoned".into()))?;
+        let mut accounts: Vec<_> = known
+            .iter()
+            .filter(|((client, _), _)| client == client_id)
+            .map(|(_, (id, account))| WamAccountAssociation {
+                native_account_id: id.clone(),
+                account: account.clone(),
+            })
+            .collect();
+        accounts.sort_by_key(|entry| entry.account.cache_key());
+        Ok(WamAccountSnapshot {
+            version: 1,
+            client_id: client_id.into(),
+            authority: self.authority.clone(),
+            provider_id: AAD_PROVIDER_ID.into(),
+            accounts,
+        })
+    }
+
+    /// Atomically replace this client's associations from integrity-protected data.
+    /// Rejects mismatched client/provider/authority, incomplete identity and
+    /// duplicate identities. Structural validation does not authenticate a snapshot.
+    /// Native enumeration/lookup checks existence; token results recheck identity.
+    pub fn import_account_associations(
+        &self,
+        client_id: &str,
+        snapshot: WamAccountSnapshot,
+    ) -> Result<()> {
+        let replacement = validate_snapshot(client_id, &self.authority, snapshot)?;
+        let mut known = self
+            .accounts
+            .lock()
+            .map_err(|_| MsalError::AuthenticationFailed("WAM account map poisoned".into()))?;
+        known.retain(|(client, _), _| client != client_id);
+        known.extend(replacement);
+        Ok(())
+    }
+
+    /// Look up an exact client-bound identity and verify its WAM account exists.
+    /// A home ID alone is insufficient for guest/resource-tenant selection.
+    pub async fn account_for_client(
+        &self,
+        client_id: &str,
+        account: &AccountInfo,
+    ) -> Result<AccountInfo> {
+        self.find_account(client_id, account, None).await?;
+        let known = self
+            .accounts
+            .lock()
+            .map_err(|_| MsalError::AuthenticationFailed("WAM account map poisoned".into()))?;
+        known
+            .get(&(client_id.into(), account.cache_key()))
+            .map(|(_, account)| account.clone())
+            .ok_or_else(|| {
+                MsalError::AuthenticationFailed("WAM association changed during lookup".into())
+            })
+    }
+
     /// Create a broker for the public-cloud AAD provider.
     pub async fn new() -> Result<Self> {
         let provider =
@@ -57,7 +147,7 @@ impl WamBroker {
         Ok(Self {
             provider,
             authority: DEFAULT_AUTHORITY.into(),
-            accounts: Mutex::new(HashMap::new()),
+            accounts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -74,7 +164,7 @@ impl WamBroker {
         Ok(Self {
             provider,
             authority: authority.into(),
-            accounts: Mutex::new(HashMap::new()),
+            accounts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -83,6 +173,7 @@ impl WamBroker {
         client_id: &str,
         params: &BrokerTokenRequest,
     ) -> Result<WebTokenRequest> {
+        validate_client_id(client_id)?;
         let properties = request_properties(params, &self.authority)?;
         let request = WebTokenRequest::CreateWithPromptType(
             &self.provider,
@@ -112,12 +203,26 @@ impl WamBroker {
         mapped_account_id(&accounts, client_id, account)
     }
 
-    async fn find_account(&self, client_id: &str, account: &AccountInfo) -> Result<WebAccount> {
+    async fn find_account(
+        &self,
+        client_id: &str,
+        account: &AccountInfo,
+        cancellation: Option<&crate::request::CancellationToken>,
+    ) -> Result<WebAccount> {
         let id = self.mapped_id(client_id, account)?;
-        WebAuthenticationCoreManager::FindAccountAsync(&self.provider, &HSTRING::from(id))
-            .map_err(native_error)?
-            .await
-            .map_err(native_error)
+        if let Some(token) = cancellation {
+            token.check_cancelled()?;
+        }
+        let operation =
+            WebAuthenticationCoreManager::FindAccountAsync(&self.provider, &HSTRING::from(&id))
+                .map_err(native_error)?;
+        let found = await_operation(operation, cancellation).await?;
+        if found.Id().map_err(native_error)? != id.as_str() {
+            return Err(MsalError::AuthenticationFailed(
+                "WAM lookup returned a different native ID".into(),
+            ));
+        }
+        Ok(found)
     }
 
     fn parse_token_response(
@@ -276,6 +381,7 @@ fn mapped_account_id(
     client_id: &str,
     account: &AccountInfo,
 ) -> Result<String> {
+    validate_client_id(client_id)?;
     validate_account_identity(account)?;
     accounts
         .get(&(client_id.into(), account.cache_key()))
@@ -284,7 +390,7 @@ fn mapped_account_id(
         .ok_or_else(|| {
             MsalError::Unsupported(
                 "no verified WAM ID for this client and complete account identity; \
-             obtain an interactive result from this broker instance first"
+             restore protected account associations or obtain an interactive result first"
                     .into(),
             )
         })
@@ -335,6 +441,114 @@ fn native_error(error: windows::core::Error) -> MsalError {
     MsalError::AuthenticationFailed(format!("WAM native error: {error}"))
 }
 
+fn validate_client_id(client_id: &str) -> Result<()> {
+    if client_id.trim().is_empty() {
+        return Err(MsalError::InvalidConfiguration(
+            "WAM client ID is empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot(
+    client_id: &str,
+    authority: &str,
+    snapshot: WamAccountSnapshot,
+) -> Result<AccountAssociations> {
+    validate_client_id(client_id)?;
+    if snapshot.version != 1
+        || snapshot.client_id != client_id
+        || snapshot.authority != authority
+        || snapshot.provider_id != AAD_PROVIDER_ID
+    {
+        return Err(MsalError::InvalidConfiguration(
+            "WAM snapshot version/client/provider/authority mismatch".into(),
+        ));
+    }
+    let mut replacement = AccountAssociations::new();
+    for entry in snapshot.accounts {
+        validate_account_identity(&entry.account)?;
+        if entry.native_account_id.trim().is_empty() {
+            return Err(MsalError::InvalidConfiguration(
+                "WAM snapshot native ID is empty".into(),
+            ));
+        }
+        // Reuse the routing checks: resource tenant and cloud must match.
+        let request = BrokerTokenRequest {
+            scopes: Vec::new(),
+            account: Some(entry.account.clone()),
+            claims: None,
+            force_refresh: false,
+            authority: None,
+            extra_query_parameters: Default::default(),
+            cancellation_token: None,
+            correlation_id: None,
+            window_handle: None,
+            authentication_scheme: Default::default(),
+            pop_params: None,
+        };
+        request_properties(&request, authority)?;
+        if replacement
+            .insert(
+                (client_id.into(), entry.account.cache_key()),
+                (entry.native_account_id, entry.account),
+            )
+            .is_some()
+        {
+            return Err(MsalError::InvalidConfiguration(
+                "duplicate WAM snapshot identity".into(),
+            ));
+        }
+    }
+    Ok(replacement)
+}
+
+async fn await_operation<T: RuntimeType + 'static>(
+    operation: IAsyncOperation<T>,
+    cancellation: Option<&crate::request::CancellationToken>,
+) -> Result<T> {
+    let future = async {
+        operation.clone().into_future().await.map_err(|error| {
+            if operation.Status().ok() == Some(AsyncStatus::Canceled) {
+                MsalError::OperationCancelled
+            } else {
+                native_error(error)
+            }
+        })
+    };
+    await_with_cancellation(
+        future,
+        || operation.Cancel().map_err(native_error),
+        cancellation,
+    )
+    .await
+}
+
+async fn await_with_cancellation<T>(
+    future: impl Future<Output = Result<T>>,
+    cancel: impl FnOnce() -> Result<()>,
+    cancellation: Option<&crate::request::CancellationToken>,
+) -> Result<T> {
+    tokio::pin!(future);
+    if let Some(token) = cancellation {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                cancel()?;
+                // Cancel is cooperative. Keep waiting until native completion,
+                // and never parse/cache a result racing application cancellation.
+                future.await?;
+                return Err(MsalError::OperationCancelled);
+            }
+            result = &mut future => {
+                token.check_cancelled()?;
+                return result;
+            }
+        }
+    }
+    future.await
+}
+
 fn validate_authority(authority: &str) -> Result<()> {
     let url = url::Url::parse(authority)
         .map_err(|_| MsalError::InvalidConfiguration("invalid broker authority URL".into()))?;
@@ -358,7 +572,7 @@ fn request_properties(
     request: &BrokerTokenRequest,
     default_authority: &str,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    validate_request(request)?;
+    validate_request_options(request, true)?;
     if request.force_refresh {
         return Err(MsalError::Unsupported(
             "raw WAM has no verified force-refresh contract; MSALRuntime is required".into(),
@@ -458,6 +672,10 @@ impl NativeBroker for WamBroker {
         true
     }
 
+    fn supports_native_cancellation(&self) -> bool {
+        true
+    }
+
     fn acquire_token_silent<'a>(
         &'a self,
         client_id: &'a str,
@@ -468,14 +686,18 @@ impl NativeBroker for WamBroker {
             let account = request.account.as_ref().ok_or_else(|| {
                 MsalError::MissingParameter("account is required for silent broker flow".into())
             })?;
-            let web_account = self.find_account(client_id, account).await?;
-            let result = WebAuthenticationCoreManager::GetTokenSilentlyWithWebAccountAsync(
+            let web_account = self
+                .find_account(client_id, account, request.cancellation_token.as_ref())
+                .await?;
+            if let Some(token) = &request.cancellation_token {
+                token.check_cancelled()?;
+            }
+            let operation = WebAuthenticationCoreManager::GetTokenSilentlyWithWebAccountAsync(
                 &wam_request,
                 &web_account,
             )
-            .map_err(native_error)?
-            .await
             .map_err(native_error)?;
+            let result = await_operation(operation, request.cancellation_token.as_ref()).await?;
             self.handle_result(client_id, request, &result)
         })
     }
@@ -488,7 +710,12 @@ impl NativeBroker for WamBroker {
         Box::pin(async move {
             let wam_request = self.build_token_request(client_id, request)?;
             let operation = if let Some(account) = &request.account {
-                let web_account = self.find_account(client_id, account).await?;
+                let web_account = self
+                    .find_account(client_id, account, request.cancellation_token.as_ref())
+                    .await?;
+                if let Some(token) = &request.cancellation_token {
+                    token.check_cancelled()?;
+                }
                 WebAuthenticationCoreManager::RequestTokenWithWebAccountAsync(
                     &wam_request,
                     &web_account,
@@ -497,7 +724,7 @@ impl NativeBroker for WamBroker {
                 WebAuthenticationCoreManager::RequestTokenAsync(&wam_request)
             }
             .map_err(native_error)?;
-            let result = operation.await.map_err(native_error)?;
+            let result = await_operation(operation, request.cancellation_token.as_ref()).await?;
             self.handle_result(client_id, request, &result)
         })
     }
@@ -508,7 +735,7 @@ impl NativeBroker for WamBroker {
         request: &'a BrokerSignOutRequest,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let web_account = self.find_account(client_id, &request.account).await?;
+            let web_account = self.find_account(client_id, &request.account, None).await?;
             web_account
                 .SignOutWithClientIdAsync(&HSTRING::from(client_id))
                 .map_err(native_error)?
@@ -529,6 +756,7 @@ impl NativeBroker for WamBroker {
         _correlation_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AccountInfo>>> + Send + 'a>> {
         Box::pin(async move {
+            validate_client_id(client_id)?;
             let result = WebAuthenticationCoreManager::FindAllAccountsWithClientIdAsync(
                 &self.provider,
                 &HSTRING::from(client_id),
@@ -623,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_refresh_and_cancellation_fail_preflight() {
+    fn refresh_is_unsupported_but_native_cancellation_is_accepted() {
         let mut request = request();
         request.force_refresh = true;
         assert!(matches!(
@@ -633,10 +861,7 @@ mod tests {
         request.force_refresh = false;
         let token = crate::request::CancellationToken::new();
         request.cancellation_token = Some(token.clone());
-        assert!(matches!(
-            request_properties(&request, DEFAULT_AUTHORITY),
-            Err(MsalError::Unsupported(_))
-        ));
+        assert!(request_properties(&request, DEFAULT_AUTHORITY).is_ok());
         token.cancel();
         assert!(matches!(
             request_properties(&request, DEFAULT_AUTHORITY),
@@ -668,8 +893,154 @@ mod tests {
             properties["authority"],
             "https://login.microsoftonline.com/resource-tenant"
         );
-        request.authority = Some("https://login.microsoftonline.com/home-tenant".into());
+        request.authority =
+            Some("https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111".into());
         assert!(request_properties(&request, DEFAULT_AUTHORITY).is_err());
+    }
+
+    fn snapshot() -> WamAccountSnapshot {
+        WamAccountSnapshot {
+            version: 1,
+            client_id: "client".into(),
+            authority: DEFAULT_AUTHORITY.into(),
+            provider_id: AAD_PROVIDER_ID.into(),
+            accounts: vec![WamAccountAssociation {
+                native_account_id: "opaque-native-id".into(),
+                account: AccountInfo {
+                    home_account_id: "home-user.home-tenant".into(),
+                    local_account_id: "guest".into(),
+                    tenant_id: "resource-tenant".into(),
+                    environment: crate::account::AAD_PUBLIC_CLOUD_ENVIRONMENT.into(),
+                    username: String::new(),
+                    name: None,
+                    id_token_claims: None,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn protected_snapshot_round_trip_restores_exact_cold_selection() {
+        let snapshot = snapshot();
+        let account = snapshot.accounts[0].account.clone();
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let imported = validate_snapshot(
+            "client",
+            DEFAULT_AUTHORITY,
+            serde_json::from_slice(&encoded).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            mapped_account_id(&imported, "client", &account).unwrap(),
+            "opaque-native-id"
+        );
+        assert!(mapped_account_id(&imported, "other-client", &account).is_err());
+        for field in ["home", "local", "tenant", "environment"] {
+            let mut changed = account.clone();
+            match field {
+                "home" => changed.home_account_id = "another.home-tenant".into(),
+                "local" => changed.local_account_id = "another-object".into(),
+                "tenant" => changed.tenant_id = "home-tenant".into(),
+                _ => changed.environment = "login.microsoftonline.us".into(),
+            }
+            assert!(
+                mapped_account_id(&imported, "client", &changed).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_scope_identity_and_conflicting_entries() {
+        for field in [
+            "version",
+            "client",
+            "authority",
+            "provider",
+            "native",
+            "home",
+            "local",
+            "tenant",
+            "environment",
+            "duplicate",
+        ] {
+            let mut value = snapshot();
+            match field {
+                "version" => value.version = 2,
+                "client" => value.client_id = "other".into(),
+                "authority" => value.authority = "https://login.microsoftonline.us/common".into(),
+                "provider" => value.provider_id = "other".into(),
+                "native" => value.accounts[0].native_account_id.clear(),
+                "home" => value.accounts[0].account.home_account_id.clear(),
+                "local" => value.accounts[0].account.local_account_id.clear(),
+                "tenant" => value.accounts[0].account.tenant_id.clear(),
+                "environment" => {
+                    value.accounts[0].account.environment = "login.microsoftonline.us".into()
+                }
+                _ => value.accounts.push(value.accounts[0].clone()),
+            }
+            assert!(
+                validate_snapshot("client", DEFAULT_AUTHORITY, value).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_cancellation_dispatches_cancel_and_waits_for_terminal_result() {
+        let token = crate::request::CancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let future = async {
+            started_tx.send(()).unwrap();
+            terminal_rx.await.unwrap();
+            Ok(42)
+        };
+        let acquisition = await_with_cancellation(
+            future,
+            || {
+                cancel_tx.send(()).unwrap();
+                Ok(())
+            },
+            Some(&token),
+        );
+        tokio::pin!(acquisition);
+        tokio::select! {
+            biased;
+            result = &mut acquisition => panic!("completed before cancellation: {result:?}"),
+            _ = started_rx => {}
+        }
+        token.cancel();
+        tokio::select! {
+            biased;
+            result = &mut acquisition => panic!("returned without native completion: {result:?}"),
+            _ = cancel_rx => {}
+        }
+        terminal_tx.send(()).unwrap();
+        assert!(matches!(
+            acquisition.await,
+            Err(MsalError::OperationCancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_failure_surfaces_and_cancel_wins_ready_result_race() {
+        let token = crate::request::CancellationToken::new();
+        token.cancel();
+        assert!(matches!(
+            await_with_cancellation(
+                async { Ok(42) },
+                || { Err(MsalError::AuthenticationFailed("Cancel failed".into())) },
+                Some(&token)
+            )
+            .await,
+            Err(MsalError::AuthenticationFailed(_))
+        ));
+        assert!(matches!(
+            await_with_cancellation(async { Ok(42) }, || Ok(()), Some(&token)).await,
+            Err(MsalError::OperationCancelled)
+        ));
     }
 
     #[test]
