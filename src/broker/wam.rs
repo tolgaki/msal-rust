@@ -126,17 +126,17 @@ impl WamBroker {
         client_id: &str,
         account: &AccountInfo,
     ) -> Result<AccountInfo> {
-        self.find_account(client_id, account, None).await?;
+        let native_id = self
+            .find_account(client_id, account, None)
+            .await?
+            .Id()
+            .map_err(native_error)?
+            .to_string();
         let known = self
             .accounts
             .lock()
             .map_err(|_| MsalError::AuthenticationFailed("WAM account map poisoned".into()))?;
-        known
-            .get(&(client_id.into(), account.cache_key()))
-            .map(|(_, account)| account.clone())
-            .ok_or_else(|| {
-                MsalError::AuthenticationFailed("WAM association changed during lookup".into())
-            })
+        account_after_native_lookup(&known, client_id, account, &native_id)
     }
 
     /// Create a broker for the public-cloud AAD provider.
@@ -398,6 +398,21 @@ fn mapped_account_id(
         })
 }
 
+fn account_after_native_lookup(
+    accounts: &AccountAssociations,
+    client_id: &str,
+    account: &AccountInfo,
+    checked_native_id: &str,
+) -> Result<AccountInfo> {
+    accounts
+        .get(&(client_id.into(), account.cache_key()))
+        .filter(|(id, known)| id == checked_native_id && same_account(known, account))
+        .map(|(_, account)| account.clone())
+        .ok_or_else(|| {
+            MsalError::AuthenticationFailed("WAM association changed during lookup".into())
+        })
+}
+
 fn wam_response_error(
     status: WebTokenRequestStatus,
     description: String,
@@ -589,11 +604,7 @@ fn request_properties(
         .map_err(|_| MsalError::InvalidConfiguration("invalid broker authority URL".into()))?;
     if let Some(account) = &request.account {
         let host = authority.host_str().unwrap_or_default();
-        let public_alias = matches!(host, "login.microsoftonline.com" | "login.windows.net");
-        if !host.eq_ignore_ascii_case(&account.environment)
-            && !(public_alias
-                && account.environment == crate::account::AAD_PUBLIC_CLOUD_ENVIRONMENT)
-        {
+        if !crate::authority::environments_equivalent(host, &account.environment) {
             return Err(MsalError::InvalidConfiguration(
                 "selected account environment differs from WAM authority".into(),
             ));
@@ -972,6 +983,44 @@ mod tests {
         assert_eq!(
             request_properties(&request, default_authority).unwrap()["authority"],
             resource_authority
+        );
+    }
+
+    #[test]
+    fn checked_lookup_rejects_a_native_id_replaced_by_concurrent_import() {
+        let snapshot = snapshot();
+        let account = snapshot.accounts[0].account.clone();
+        let mut known = validate_snapshot("client", DEFAULT_AUTHORITY, snapshot).unwrap();
+        assert!(same_account(
+            &account_after_native_lookup(&known, "client", &account, "opaque-native-id").unwrap(),
+            &account,
+        ));
+        known
+            .get_mut(&("client".into(), account.cache_key()))
+            .unwrap()
+            .0 = "unchecked-replacement".into();
+        assert!(matches!(
+            account_after_native_lookup(&known, "client", &account, "opaque-native-id"),
+            Err(MsalError::AuthenticationFailed(_)),
+        ));
+    }
+
+    #[test]
+    fn snapshot_and_selection_use_the_same_verified_cloud_aliases() {
+        let authority = "https://sts.windows.net/common";
+        let mut snapshot = snapshot();
+        snapshot.authority = authority.into();
+        let account = snapshot.accounts[0].account.clone();
+        let restored = validate_snapshot("client", authority, snapshot).unwrap();
+        assert_eq!(
+            mapped_account_id(&restored, "client", &account).unwrap(),
+            "opaque-native-id"
+        );
+        let mut request = request();
+        request.account = Some(account);
+        assert_eq!(
+            request_properties(&request, authority).unwrap()["authority"],
+            "https://sts.windows.net/resource-tenant"
         );
     }
 
