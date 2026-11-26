@@ -213,7 +213,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Authentication contracts and limits
 
-User login requests include `openid profile offline_access` and `client_info=1`.
+User login requests include `openid profile offline_access`. Device-code
+initiation omits `client_info`; authorization URLs and all token exchanges
+(including device polling, refresh and authorization-code redemption) include
+`client_info=1`.
 `home_account_id` comes from `client_info`; the resource tenant and local account
 come from the ID token, **not** from the home tenant. Missing/malformed identity
 on a login fails explicitly. Account selection compares home ID, local ID,
