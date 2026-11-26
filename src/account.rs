@@ -37,8 +37,8 @@ impl AccountInfo {
     pub fn cache_key(&self) -> String {
         serde_json::json!([
             self.home_account_id,
-            self.environment.to_ascii_lowercase(),
-            self.tenant_id,
+            crate::authority::canonical_environment(&self.environment),
+            self.tenant_id.to_ascii_lowercase(),
             self.local_account_id
         ])
         .to_string()
@@ -49,7 +49,7 @@ impl AccountInfo {
         self.home_account_id == other.home_account_id
             && self.local_account_id == other.local_account_id
             && self.tenant_id.eq_ignore_ascii_case(&other.tenant_id)
-            && self.environment.eq_ignore_ascii_case(&other.environment)
+            && crate::authority::environments_equivalent(&self.environment, &other.environment)
     }
 
     pub(crate) fn validate(&self) -> crate::error::Result<()> {

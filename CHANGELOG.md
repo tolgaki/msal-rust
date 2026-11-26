@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer report false success. Native runtime behavior remains platform-specific.
 - ID-token parsing documents the direct TLS/native provenance boundary, not a
   blanket public-client local-signature requirement or arbitrary-JWT validator.
+- ID-token issuer checks follow the authority type: B2C (tenant-scoped issuer
+  without the policy), ADFS (no `tid` or `client_info`; tenant `adfs`), CIAM
+  (tenant-ID subdomain) and Entra public-cloud host aliases. `exp`/`nbf` allow
+  five minutes of clock skew. Account environments use the canonical alias.
+- Refresh tokens are partitioned only by extra parameters, so a claims
+  challenge redeems the account's existing refresh token; access tokens remain
+  partitioned by claims. Cached tokens satisfy any subset of their granted
+  scopes, ignoring OIDC scopes including `email`.
+- Silent broker calls honor cancellation by stopping the wait rather than
+  forwarding the token to adapters that reject it. Broker authority comparison
+  ignores case, aliases and trailing slashes. Tokens issued before a late
+  cancellation are cached. `sign_out` no longer requires the account to match
+  the current authority.
 
 These request-field additions and complete-identity cache keys are source/API
 changes; prefer constructors and update explicit struct literals. No main-branch

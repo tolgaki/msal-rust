@@ -92,7 +92,7 @@ impl PublicClientApplication {
         }
         let mut request = request;
         if let Some(authority) = &request.authority {
-            if url::Url::parse(authority)? != self.state.authority.canonical_authority {
+            if !self.state.authority.is_same_authority(authority)? {
                 return Err(MsalError::InvalidConfiguration("broker authority differs from application authority; construct a separate application".into()));
             }
         }
@@ -172,11 +172,20 @@ impl PublicClientApplication {
                         force_refresh: request.force_refresh,
                         authority: Some(self.state.config.auth.authority.clone()),
                         extra_query_parameters: request.extra_query_parameters.clone(),
-                        cancellation_token: request.cancellation_token.clone(),
+                        // Native adapters cannot cancel an in-flight operation and
+                        // reject requests carrying a token. A silent native call shows
+                        // no UI, so cancellation here stops waiting for it and discards
+                        // its result instead.
+                        cancellation_token: None,
                     };
-                    let result = broker
-                        .acquire_token_silent(&self.state.config.auth.client_id, &broker_request)
-                        .await?;
+                    let result = crate::network::cancellable(
+                        request.cancellation_token.as_ref(),
+                        broker.acquire_token_silent(
+                            &self.state.config.auth.client_id,
+                            &broker_request,
+                        ),
+                    )
+                    .await?;
                     self.validate_broker_result(&result, Some(&request.account))?;
                     if self.state.config.cache.store_in_memory {
                         self.state.cache.save_with_context(&result, &context)?;
@@ -225,7 +234,9 @@ impl PublicClientApplication {
     ///
     /// If no broker is configured, only the local token cache is cleared.
     pub async fn sign_out(&self, account: &AccountInfo) -> Result<()> {
-        crate::response::validate_account_authority(account, &self.state.authority)?;
+        // Only require a complete identity: removing local state for an account
+        // whose environment/tenant no longer matches the authority must still work.
+        account.validate()?;
         // Try broker sign-out first.
         {
             let b = self.broker.read().await;

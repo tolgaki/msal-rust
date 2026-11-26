@@ -131,7 +131,8 @@ impl TokenResponse {
             // the caller's already-authenticated, token-associated cache identity.
             return Ok(expected.cloned());
         };
-        let claims = validate_endpoint_id_token(id_token, authority, client_id, nonce)?;
+        let (claims, tenant_id) =
+            validate_endpoint_id_token(id_token, authority, client_id, nonce)?;
         let local_account_id = claims["oid"]
             .as_str()
             .or_else(|| claims["sub"].as_str())
@@ -139,30 +140,26 @@ impl TokenResponse {
             .ok_or_else(|| {
                 MsalError::InvalidToken("ID token has no local account identifier".into())
             })?;
-        let tenant_id = claims["tid"]
-            .as_str()
-            .ok_or_else(|| MsalError::InvalidToken("ID token has no tenant identifier".into()))?;
-        let home_account_id = match client_info {
-            Some(info) => info.home_account_id(),
-            None => match expected {
-                Some(account) => account.home_account_id.clone(),
-                None => {
-                    return Err(MsalError::InvalidToken(
-                        "ID token response missing client_info; cannot establish home account"
-                            .into(),
-                    ))
-                }
-            },
+        let home_account_id = match (client_info, expected) {
+            (Some(info), _) => info.home_account_id(),
+            (None, Some(account)) => account.home_account_id.clone(),
+            // ADFS issues no client_info; its subject is the stable home identity.
+            (None, None) if authority.authority_type == crate::authority::AuthorityType::Adfs => {
+                local_account_id.to_string()
+            }
+            (None, None) => {
+                return Err(MsalError::InvalidToken(
+                    "ID token response missing client_info; cannot establish home account".into(),
+                ))
+            }
         };
         let account = AccountInfo {
             home_account_id,
             local_account_id: local_account_id.into(),
-            environment: authority
-                .canonical_authority
-                .host_str()
-                .unwrap_or_default()
-                .into(),
-            tenant_id: tenant_id.into(),
+            environment: crate::authority::canonical_environment(
+                authority.canonical_authority.host_str().unwrap_or_default(),
+            ),
+            tenant_id,
             username: claims["preferred_username"]
                 .as_str()
                 .unwrap_or_default()
@@ -188,10 +185,10 @@ pub(crate) fn validate_account_authority(
 ) -> crate::error::Result<()> {
     use crate::error::MsalError;
     account.validate()?;
-    if !account
-        .environment
-        .eq_ignore_ascii_case(authority.canonical_authority.host_str().unwrap_or_default())
-    {
+    if !crate::authority::environments_equivalent(
+        &account.environment,
+        authority.canonical_authority.host_str().unwrap_or_default(),
+    ) {
         return Err(MsalError::InvalidToken(
             "account environment differs from authority".into(),
         ));
@@ -215,8 +212,9 @@ fn validate_tenant(
         ));
     }
     const CONSUMER_TENANT: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
-    if (authority.tenant == "consumers" && tenant != CONSUMER_TENANT)
-        || (authority.tenant == "organizations" && tenant == CONSUMER_TENANT)
+    let configured = authority.tenant.to_ascii_lowercase();
+    if (configured == "consumers" && !tenant.eq_ignore_ascii_case(CONSUMER_TENANT))
+        || (configured == "organizations" && tenant.eq_ignore_ascii_case(CONSUMER_TENANT))
     {
         return Err(MsalError::InvalidToken(
             "token tenant violates authority account type".into(),
@@ -225,14 +223,23 @@ fn validate_tenant(
     Ok(())
 }
 
+/// Allowed clock skew for ID token `exp`/`nbf` checks, in seconds.
+const ID_TOKEN_CLOCK_SKEW: i64 = 300;
+
+/// Tenant identifier used for ADFS accounts, which carry no `tid` claim.
+pub(crate) const ADFS_TENANT: &str = "adfs";
+
 /// Only for ID tokens received from the configured token endpoint over TLS.
 /// This is not an arbitrary JWT authenticator or resource-server validator.
+///
+/// Returns the decoded claims and the tenant the token was issued for.
 pub(crate) fn validate_endpoint_id_token(
     token: &str,
     authority: &crate::authority::Authority,
     client_id: &str,
     nonce: Option<&str>,
-) -> crate::error::Result<serde_json::Value> {
+) -> crate::error::Result<(serde_json::Value, String)> {
+    use crate::authority::AuthorityType;
     use crate::error::MsalError;
     let header = jsonwebtoken::decode_header(token)?;
     if header.alg != jsonwebtoken::Algorithm::RS256
@@ -242,7 +249,7 @@ pub(crate) fn validate_endpoint_id_token(
             .map_or(true, |signature| signature.is_empty())
     {
         return Err(MsalError::InvalidToken(
-            "expected an Entra RS256 ID token".into(),
+            "expected an RS256-signed ID token".into(),
         ));
     }
     let claims = crate::crypto::decode_jwt_payload(token)?;
@@ -257,34 +264,167 @@ pub(crate) fn validate_endpoint_id_token(
         }
     }
     let now = chrono::Utc::now().timestamp();
-    if claims["exp"].as_i64().map_or(true, |exp| exp <= now)
-        || claims
-            .get("nbf")
-            .is_some_and(|nbf| nbf.as_i64().map_or(true, |nbf| nbf > now + 60))
+    if claims["exp"]
+        .as_i64()
+        .map_or(true, |exp| exp.saturating_add(ID_TOKEN_CLOCK_SKEW) <= now)
+        || claims.get("nbf").is_some_and(|nbf| {
+            nbf.as_i64()
+                .map_or(true, |nbf| nbf > now.saturating_add(ID_TOKEN_CLOCK_SKEW))
+        })
     {
         return Err(MsalError::InvalidToken(
             "ID token expired or not yet valid".into(),
         ));
     }
-    let tenant = claims["tid"]
-        .as_str()
-        .ok_or_else(|| MsalError::InvalidToken("ID token missing tenant".into()))?;
-    validate_tenant(tenant, authority)?;
     let issuer = claims["iss"]
         .as_str()
-        .ok_or_else(|| MsalError::InvalidToken("ID token missing issuer".into()))?;
-    let expected = if authority.authority_type == crate::authority::AuthorityType::Aad {
-        format!(
-            "https://{}/{tenant}/v2.0",
-            authority.canonical_authority.host_str().unwrap_or_default()
-        )
-    } else {
-        authority.issuer.clone()
-    };
-    if issuer != expected {
-        return Err(MsalError::InvalidToken(
-            "ID token issuer differs from authority/tenant".into(),
-        ));
+        .and_then(|issuer| url::Url::parse(issuer).ok())
+        .ok_or_else(|| MsalError::InvalidToken("ID token missing or invalid issuer".into()))?;
+    let issuer_error =
+        || MsalError::InvalidToken("ID token issuer differs from authority/tenant".into());
+    if issuer.scheme() != "https"
+        || !issuer.username().is_empty()
+        || issuer.password().is_some()
+        || issuer.query().is_some()
+        || issuer.fragment().is_some()
+    {
+        return Err(issuer_error());
     }
-    Ok(claims)
+    let authority_host = authority.canonical_authority.host_str().unwrap_or_default();
+    let issuer_host = issuer.host_str().unwrap_or_default();
+    let tid = claims["tid"].as_str().filter(|tid| !tid.trim().is_empty());
+    // Path of a v2 issuer: `/{tenant}/v2.0`, with or without a trailing slash.
+    let v2_issuer_tenant = || -> Option<&str> {
+        let path = issuer.path().strip_suffix('/').unwrap_or(issuer.path());
+        let tenant = path.strip_prefix('/')?.strip_suffix("/v2.0")?;
+        (!tenant.is_empty() && !tenant.contains('/')).then_some(tenant)
+    };
+    let tenant = match authority.authority_type {
+        AuthorityType::Aad => {
+            let tid =
+                tid.ok_or_else(|| MsalError::InvalidToken("ID token missing tenant".into()))?;
+            if !crate::authority::environments_equivalent(issuer_host, authority_host)
+                || v2_issuer_tenant() != Some(tid)
+            {
+                return Err(issuer_error());
+            }
+            tid.to_string()
+        }
+        AuthorityType::Ciam => {
+            // CIAM issuers use the tenant ID as the subdomain, which may differ
+            // from the tenant name used in the configured authority host.
+            let tid =
+                tid.ok_or_else(|| MsalError::InvalidToken("ID token missing tenant".into()))?;
+            let expected_host = format!("{tid}.ciamlogin.com");
+            if !(issuer_host.eq_ignore_ascii_case(authority_host)
+                || issuer_host.eq_ignore_ascii_case(&expected_host))
+                || v2_issuer_tenant() != Some(tid)
+            {
+                return Err(issuer_error());
+            }
+            tid.to_string()
+        }
+        AuthorityType::AadB2C => {
+            // B2C issuers are `https://{host}/{tenant-id}/v2.0/`, without the policy.
+            let issuer_tenant = v2_issuer_tenant().ok_or_else(issuer_error)?;
+            if !issuer_host.eq_ignore_ascii_case(authority_host)
+                || tid.is_some_and(|tid| !tid.eq_ignore_ascii_case(issuer_tenant))
+            {
+                return Err(issuer_error());
+            }
+            issuer_tenant.to_string()
+        }
+        AuthorityType::Adfs => {
+            if !issuer_host.eq_ignore_ascii_case(authority_host)
+                || issuer.path().trim_end_matches('/') != "/adfs"
+            {
+                return Err(issuer_error());
+            }
+            ADFS_TENANT.to_string()
+        }
+    };
+    validate_tenant(&tenant, authority)?;
+    Ok((claims, tenant))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    const TENANT: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn token(claims: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
+        format!("{header}.{payload}.signature")
+    }
+
+    fn claims(issuer: &str) -> serde_json::Value {
+        serde_json::json!({
+            "aud": "client", "iss": issuer, "tid": TENANT, "oid": "object",
+            "exp": chrono::Utc::now().timestamp() + 3600
+        })
+    }
+
+    fn check(authority: &str, claims: serde_json::Value) -> crate::error::Result<String> {
+        let authority = crate::authority::Authority::from_url_no_discovery(authority)?;
+        validate_endpoint_id_token(&token(claims), &authority, "client", None)
+            .map(|(_, tenant)| tenant)
+    }
+
+    #[test]
+    fn aad_issuer_accepts_public_cloud_aliases_only() {
+        let issuer = format!("https://login.microsoftonline.com/{TENANT}/v2.0");
+        for authority in [
+            "https://login.windows.net/common",
+            "https://login.microsoft.com/organizations",
+            "https://login.microsoftonline.com/common",
+        ] {
+            assert_eq!(check(authority, claims(&issuer)).unwrap(), TENANT);
+        }
+        assert!(check("https://login.microsoftonline.us/common", claims(&issuer)).is_err());
+        let other_tenant = "https://login.microsoftonline.com/other/v2.0";
+        assert!(check("https://login.windows.net/common", claims(other_tenant)).is_err());
+    }
+
+    #[test]
+    fn ciam_issuer_uses_tenant_id_subdomain() {
+        let issuer = format!("https://{TENANT}.ciamlogin.com/{TENANT}/v2.0");
+        assert_eq!(
+            check(
+                "https://contoso.ciamlogin.com/contoso.onmicrosoft.com",
+                claims(&issuer)
+            )
+            .unwrap(),
+            TENANT
+        );
+        assert!(check(
+            "https://contoso.ciamlogin.com/contoso.onmicrosoft.com",
+            claims(&format!("https://evil.ciamlogin.com/{TENANT}/v2.0"))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn b2c_issuer_is_tenant_scoped_without_policy() {
+        let authority = "https://contoso.b2clogin.com/contoso.onmicrosoft.com/B2C_1_signin";
+        let issuer = format!("https://contoso.b2clogin.com/{TENANT}/v2.0/");
+        assert_eq!(check(authority, claims(&issuer)).unwrap(), TENANT);
+        assert!(check(
+            authority,
+            claims(&format!("https://other.b2clogin.com/{TENANT}/v2.0/"))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn expiry_allows_clock_skew_but_not_stale_tokens() {
+        let issuer = format!("https://login.microsoftonline.com/{TENANT}/v2.0");
+        let mut value = claims(&issuer);
+        value["exp"] = (chrono::Utc::now().timestamp() - 60).into();
+        assert!(check("https://login.microsoftonline.com/common", value.clone()).is_ok());
+        value["exp"] = (chrono::Utc::now().timestamp() - 3600).into();
+        assert!(check("https://login.microsoftonline.com/common", value).is_err());
+    }
 }

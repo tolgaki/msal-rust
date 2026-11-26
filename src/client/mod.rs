@@ -127,12 +127,15 @@ impl AppState {
                 .find(|(key, _)| *key == "refresh_token")
                 .map(|(_, value)| value.to_string());
         }
-        if let Some(token) = options.cancellation {
-            token.check_cancelled()?;
-        }
+        // Cache before honoring a late cancellation: the server has already
+        // issued (and possibly rotated) tokens, and dropping them here could
+        // strand the cache with a refresh token that is no longer valid.
         let context = crate::cache::request_context(options.claims, options.extra);
         if self.config.cache.store_in_memory {
             self.cache.save_with_context(&result, &context)?;
+        }
+        if let Some(token) = options.cancellation {
+            token.check_cancelled()?;
         }
         Ok(result)
     }

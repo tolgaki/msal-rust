@@ -60,26 +60,68 @@ fn lock_error() -> MsalError {
     MsalError::CacheError("lock poisoned".into())
 }
 
-fn scope_key(scopes: &[String]) -> String {
-    let mut scopes: Vec<_> = scopes
-        .iter()
-        .map(|s| s.to_lowercase())
-        .filter(|scope| !matches!(scope.as_str(), "openid" | "profile" | "offline_access"))
-        .collect();
-    scopes.sort();
-    scopes.dedup();
-    scopes.join(" ")
+/// OIDC scopes the server adds to login responses; they never select a resource token.
+fn is_oidc_scope(scope: &str) -> bool {
+    matches!(scope, "openid" | "profile" | "offline_access" | "email")
 }
 
-/// Claims and opaque extra parameters partition cache entries, not server sessions.
+fn normalized_scopes(scopes: &[String]) -> std::collections::BTreeSet<String> {
+    scopes
+        .iter()
+        .map(|s| s.to_lowercase())
+        .filter(|scope| !is_oidc_scope(scope))
+        .collect()
+}
+
+fn scope_key(scopes: &[String]) -> String {
+    normalized_scopes(scopes)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether a cached token granted for `cached` scopes satisfies `requested`.
+///
+/// The server may return more scopes than were requested (for example, other
+/// consented scopes of the same resource), so a superset satisfies the request.
+fn scopes_satisfy(
+    cached: &std::collections::BTreeSet<String>,
+    requested: &std::collections::BTreeSet<String>,
+) -> bool {
+    if requested.is_empty() {
+        cached.is_empty()
+    } else {
+        requested.is_subset(cached)
+    }
+}
+
+/// Cache partition for a request.
+///
+/// Access tokens are partitioned by claims and opaque extra parameters, so a
+/// claims challenge never reuses a token issued without it. Refresh tokens are
+/// partitioned only by the extra parameters (e.g. `client_session`): claims are a
+/// per-request challenge that must be redeemable with the account's existing
+/// refresh token. Neither partition proves server-side session enforcement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CacheContext {
+    access: String,
+    refresh: String,
+}
+
 pub(crate) fn request_context(
     claims: &Option<String>,
     extra: &std::collections::BTreeMap<String, String>,
-) -> String {
-    if claims.is_none() && extra.is_empty() {
-        String::new()
-    } else {
-        serde_json::json!([claims, extra]).to_string()
+) -> CacheContext {
+    let encode = |claims: &Option<String>| {
+        if claims.is_none() && extra.is_empty() {
+            String::new()
+        } else {
+            serde_json::json!([claims, extra]).to_string()
+        }
+    };
+    CacheContext {
+        access: encode(claims),
+        refresh: encode(&None),
     }
 }
 
@@ -102,10 +144,13 @@ fn validate_result(result: &AuthenticationResult) -> Result<&AccountInfo> {
     Ok(account)
 }
 
+/// Insert an access token under `context`, and its refresh token under
+/// `refresh_context` when one is given.
 fn insert_result(
     state: &mut CacheState,
     result: &AuthenticationResult,
     context: &str,
+    refresh_context: Option<&str>,
 ) -> Result<()> {
     let Some(account) = result.account.as_ref() else {
         return Ok(());
@@ -127,13 +172,13 @@ fn insert_result(
             context: context.into(),
         },
     );
-    if let Some(token) = &result.refresh_token {
+    if let (Some(token), Some(refresh_context)) = (&result.refresh_token, refresh_context) {
         state.refresh_tokens.insert(
-            (account_key.clone(), context.into()),
+            (account_key.clone(), refresh_context.into()),
             CachedRefreshToken {
                 account: account.clone(),
                 token: token.clone(),
-                context: context.into(),
+                context: refresh_context.into(),
             },
         );
     }
@@ -154,18 +199,19 @@ impl TokenCache {
     }
 
     pub fn save(&self, result: &AuthenticationResult) -> Result<()> {
-        self.save_with_context(result, "")
+        self.save_with_context(result, &CacheContext::default())
     }
 
     pub(crate) fn save_with_context(
         &self,
         result: &AuthenticationResult,
-        context: &str,
+        context: &CacheContext,
     ) -> Result<()> {
         insert_result(
             &mut *self.state.write().map_err(|_| lock_error())?,
             result,
-            context,
+            &context.access,
+            Some(&context.refresh),
         )
     }
 
@@ -175,26 +221,31 @@ impl TokenCache {
         account: &AccountInfo,
         scopes: &[String],
     ) -> Result<Option<AuthenticationResult>> {
-        self.lookup_with_context(account, scopes, "")
+        self.lookup_with_context(account, scopes, &CacheContext::default())
     }
 
     pub(crate) fn lookup_with_context(
         &self,
         account: &AccountInfo,
         scopes: &[String],
-        context: &str,
+        context: &CacheContext,
     ) -> Result<Option<AuthenticationResult>> {
         account.validate()?;
         let state = self.state.read().map_err(|_| lock_error())?;
-        let key = AccessTokenKey {
-            account: account.cache_key(),
-            scopes: scope_key(scopes),
-            context: context.into(),
-        };
+        let account_key = account.cache_key();
+        let requested = normalized_scopes(scopes);
+        let fresh_after = chrono::Utc::now().timestamp() + 300;
         Ok(state
             .access_tokens
-            .get(&key)
-            .filter(|entry| entry.result.expires_on > chrono::Utc::now().timestamp() + 300)
+            .iter()
+            .filter(|(key, entry)| {
+                key.account == account_key
+                    && key.context == context.access
+                    && entry.result.expires_on > fresh_after
+                    && scopes_satisfy(&normalized_scopes(&entry.result.scopes), &requested)
+            })
+            .map(|(_, entry)| entry)
+            .max_by_key(|entry| entry.result.expires_on)
             .map(|entry| {
                 let mut result = entry.result.clone();
                 result.refresh_token = None;
@@ -212,13 +263,13 @@ impl TokenCache {
     }
 
     pub fn try_lookup_refresh_token(&self, account: &AccountInfo) -> Result<Option<String>> {
-        self.refresh_with_context(account, "")
+        self.refresh_with_context(account, &CacheContext::default())
     }
 
     pub(crate) fn refresh_with_context(
         &self,
         account: &AccountInfo,
-        context: &str,
+        context: &CacheContext,
     ) -> Result<Option<String>> {
         account.validate()?;
         Ok(self
@@ -226,7 +277,7 @@ impl TokenCache {
             .read()
             .map_err(|_| lock_error())?
             .refresh_tokens
-            .get(&(account.cache_key(), context.into()))
+            .get(&(account.cache_key(), context.refresh.clone()))
             .map(|entry| entry.token.clone()))
     }
 
@@ -287,7 +338,9 @@ impl TokenCache {
         let mut state = CacheState::default();
         for entry in snapshot.tokens {
             validate_result(&entry.result)?;
-            insert_result(&mut state, &entry.result, &entry.context)?;
+            // Refresh tokens come only from the snapshot's own refresh list,
+            // which holds the newest token for each partition.
+            insert_result(&mut state, &entry.result, &entry.context, None)?;
         }
         for entry in snapshot.refresh_tokens {
             entry.account.validate()?;

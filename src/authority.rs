@@ -154,6 +154,52 @@ impl Authority {
         }
         Ok(())
     }
+
+    /// Whether `other` names this same authority, ignoring host case, known
+    /// public-cloud host aliases, tenant case and a trailing slash.
+    pub(crate) fn is_same_authority(&self, other: &str) -> Result<bool> {
+        let other = Url::parse(other)
+            .map_err(|e| MsalError::AuthorityValidation(format!("invalid authority URL: {e}")))?;
+        let this = &self.canonical_authority;
+        let normalized_path = |url: &Url| url.path().trim_end_matches('/').to_ascii_lowercase();
+        Ok(this.scheme() == other.scheme()
+            && this.port_or_known_default() == other.port_or_known_default()
+            && environments_equivalent(
+                this.host_str().unwrap_or_default(),
+                other.host_str().unwrap_or_default(),
+            )
+            && normalized_path(this) == normalized_path(&other)
+            && other.query().is_none()
+            && other.fragment().is_none())
+    }
+}
+
+/// Hosts that Entra ID treats as the same public-cloud environment.
+const PUBLIC_CLOUD_ALIASES: &[&str] = &[
+    "login.microsoftonline.com",
+    "login.windows.net",
+    "login.microsoft.com",
+    "sts.windows.net",
+];
+
+pub(crate) fn is_public_cloud_alias(host: &str) -> bool {
+    PUBLIC_CLOUD_ALIASES
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(host))
+}
+
+/// Canonical, lowercase environment for cache keys and account identity.
+pub(crate) fn canonical_environment(host: &str) -> String {
+    if is_public_cloud_alias(host) {
+        crate::account::AAD_PUBLIC_CLOUD_ENVIRONMENT.into()
+    } else {
+        host.to_ascii_lowercase()
+    }
+}
+
+/// Whether two environments name the same cloud (case-insensitive, alias-aware).
+pub(crate) fn environments_equivalent(left: &str, right: &str) -> bool {
+    canonical_environment(left) == canonical_environment(right)
 }
 
 fn detect_authority_type(url: &Url) -> AuthorityType {

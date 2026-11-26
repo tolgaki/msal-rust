@@ -471,7 +471,8 @@ async fn mismatched_id_tokens_fail_without_cache_writes() {
     let mut wrong_account = id_claims();
     wrong_account["oid"] = "other-account".into();
     let mut expired = id_claims();
-    expired["exp"] = (chrono::Utc::now().timestamp() - 1).into();
+    // Beyond the ID token clock-skew allowance.
+    expired["exp"] = (chrono::Utc::now().timestamp() - 3600).into();
     let mut missing_tenant = id_claims();
     missing_tenant.as_object_mut().unwrap().remove("tid");
     for claims in [
@@ -638,4 +639,313 @@ async fn code_exchange_checks_nonce_and_pkce() {
         application.acquire_token_by_code(request).await,
         Err(MsalError::InvalidToken(_))
     ));
+}
+
+fn refresh_app(server: &MockServer, authority_path: &str) -> PublicClientApplication {
+    PublicClientApplication::new(
+        Configuration::builder("client")
+            .authority(format!("{}/{authority_path}", server.uri()))
+            .build(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn b2c_id_token_issuer_omits_policy_and_is_accepted() {
+    let server = MockServer::start().await;
+    let mut claims = id_claims();
+    claims["iss"] = format!("https://127.0.0.1/{TENANT}/v2.0/").into();
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/tfp/{TENANT}/B2C_1_signin/oauth2/v2.0/token"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(user_response(claims)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let value = refresh_app(&server, &format!("tfp/{TENANT}/B2C_1_signin"))
+        .acquire_token_by_refresh_token(RefreshTokenRequest::new(
+            "refresh".into(),
+            vec!["user.read".into()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(value.account.unwrap().tenant_id, TENANT);
+}
+
+#[tokio::test]
+async fn adfs_id_token_without_tid_or_client_info_establishes_account() {
+    let server = MockServer::start().await;
+    let mut claims = id_claims();
+    claims["iss"] = "https://127.0.0.1/adfs".into();
+    let object = claims.as_object_mut().unwrap();
+    object.remove("tid");
+    object.remove("oid");
+    let mut response = user_response(claims);
+    response.as_object_mut().unwrap().remove("client_info");
+    Mock::given(method("POST"))
+        .and(path("/adfs/oauth2/v2.0/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let application = refresh_app(&server, "adfs");
+    let value = application
+        .acquire_token_by_refresh_token(RefreshTokenRequest::new(
+            "refresh".into(),
+            vec!["user.read".into()],
+        ))
+        .await
+        .unwrap();
+    let identity = value.account.unwrap();
+    assert_eq!(identity.local_account_id, "subject");
+    assert_eq!(identity.home_account_id, "subject");
+    assert_eq!(identity.tenant_id, "adfs");
+    assert_eq!(application.all_accounts().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn silent_claims_challenge_redeems_refresh_token_from_unchallenged_login() {
+    let server = MockServer::start().await;
+    let application = app(&server);
+    let identity = account("127.0.0.1");
+    Mock::given(method("POST"))
+        .and(path(token_path()))
+        .and(form_field("refresh_token", "initial"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token":"plain", "expires_in":3600, "refresh_token":"cached"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut request = RefreshTokenRequest::new("initial".into(), vec!["user.read".into()]);
+    request.account = Some(identity.clone());
+    application
+        .acquire_token_by_refresh_token(request)
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path(token_path()))
+        .and(form_field("refresh_token", "cached"))
+        .and(form_field("claims", CLAIMS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token":"challenged", "expires_in":3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut silent = SilentFlowRequest::new(vec!["user.read".into()], identity.clone());
+    silent.claims = Some(CLAIMS.into());
+    // The claims challenge must not be satisfied by the unchallenged access token.
+    assert_eq!(
+        application
+            .acquire_token_silent(silent)
+            .await
+            .unwrap()
+            .access_token,
+        "challenged"
+    );
+    // And the unchallenged token is still served from cache afterwards.
+    assert_eq!(
+        application
+            .acquire_token_silent(SilentFlowRequest::new(vec!["user.read".into()], identity))
+            .await
+            .unwrap()
+            .access_token,
+        "plain"
+    );
+}
+
+#[test]
+fn cached_token_satisfies_subset_of_server_granted_scopes() {
+    let cache = TokenCache::new();
+    let identity = account("login.microsoftonline.com");
+    let mut value = result(&identity);
+    value.scopes = ["User.Read", "Mail.Read", "openid", "profile", "email"]
+        .map(String::from)
+        .to_vec();
+    cache.save(&value).unwrap();
+    for hit in [vec!["user.read"], vec!["mail.read", "User.Read"]] {
+        let scopes: Vec<String> = hit.into_iter().map(String::from).collect();
+        assert!(cache.lookup_access_token(&identity, &scopes).is_some());
+    }
+    assert!(cache
+        .lookup_access_token(&identity, &["mail.send".into()])
+        .is_none());
+}
+
+#[test]
+fn cache_treats_public_cloud_aliases_as_one_environment() {
+    let cache = TokenCache::new();
+    cache.save(&result(&account("login.windows.net"))).unwrap();
+    assert!(cache
+        .lookup_access_token(&account("login.microsoftonline.com"), &["user.read".into()])
+        .is_some());
+}
+
+/// Broker double that, like the WAM and macOS adapters, rejects any request
+/// carrying a cancellation token.
+struct StrictBroker;
+
+impl msal::broker::NativeBroker for StrictBroker {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn acquire_token_silent<'a>(
+        &'a self,
+        _client_id: &'a str,
+        request: &'a msal::broker::BrokerTokenRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = msal::error::Result<AuthenticationResult>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if request.cancellation_token.is_some() {
+                return Err(MsalError::Unsupported("native cancellation".into()));
+            }
+            let mut value = result(request.account.as_ref().unwrap());
+            value.access_token = "brokered".into();
+            value.refresh_token = None;
+            Ok(value)
+        })
+    }
+
+    fn acquire_token_interactive<'a>(
+        &'a self,
+        _client_id: &'a str,
+        request: &'a msal::broker::BrokerTokenRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = msal::error::Result<AuthenticationResult>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut value = result(&account("login.microsoftonline.com"));
+            value.access_token = request.authority.clone().unwrap();
+            value.refresh_token = None;
+            Ok(value)
+        })
+    }
+
+    fn sign_out<'a>(
+        &'a self,
+        _client_id: &'a str,
+        _request: &'a msal::broker::BrokerSignOutRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = msal::error::Result<()>> + Send + 'a>>
+    {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn all_accounts<'a>(
+        &'a self,
+        _client_id: &'a str,
+        _correlation_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = msal::error::Result<Vec<AccountInfo>>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn account<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _correlation_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = msal::error::Result<AccountInfo>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(MsalError::Unsupported("lookup".into())) })
+    }
+}
+
+async fn brokered_app() -> PublicClientApplication {
+    let application = PublicClientApplication::new(
+        Configuration::builder("client")
+            .authority(format!("https://login.microsoftonline.com/{TENANT}"))
+            .build(),
+    )
+    .unwrap();
+    application.set_broker(Box::new(StrictBroker)).await;
+    application
+}
+
+#[tokio::test]
+async fn silent_broker_call_honors_cancellation_without_forwarding_it() {
+    let application = brokered_app().await;
+    let mut silent = SilentFlowRequest::new(
+        vec!["user.read".into()],
+        account("login.microsoftonline.com"),
+    );
+    let cancellation = CancellationToken::new();
+    silent.cancellation_token = Some(cancellation.clone());
+    assert_eq!(
+        application
+            .acquire_token_silent(silent.clone())
+            .await
+            .unwrap()
+            .access_token,
+        "brokered"
+    );
+    cancellation.cancel();
+    silent.force_refresh = true;
+    assert!(matches!(
+        application.acquire_token_silent(silent).await,
+        Err(MsalError::OperationCancelled)
+    ));
+}
+
+#[tokio::test]
+async fn interactive_broker_accepts_equivalent_authority_spelling() {
+    let application = brokered_app().await;
+    for authority in [
+        format!("https://login.microsoftonline.com/{TENANT}/"),
+        format!(
+            "https://LOGIN.microsoftonline.com/{}",
+            TENANT.to_uppercase()
+        ),
+    ] {
+        let request = msal::broker::BrokerTokenRequest {
+            scopes: vec!["user.read".into()],
+            account: None,
+            claims: None,
+            force_refresh: false,
+            authority: Some(authority),
+            extra_query_parameters: Default::default(),
+            cancellation_token: None,
+            correlation_id: None,
+            window_handle: None,
+            authentication_scheme: Default::default(),
+            pop_params: None,
+        };
+        application
+            .acquire_token_interactive(request)
+            .await
+            .unwrap();
+    }
+    let request = msal::broker::BrokerTokenRequest {
+        scopes: vec!["user.read".into()],
+        account: None,
+        claims: None,
+        force_refresh: false,
+        authority: Some(format!("https://login.microsoftonline.com/{OTHER_TENANT}")),
+        extra_query_parameters: Default::default(),
+        cancellation_token: None,
+        correlation_id: None,
+        window_handle: None,
+        authentication_scheme: Default::default(),
+        pop_params: None,
+    };
+    assert!(matches!(
+        application.acquire_token_interactive(request).await,
+        Err(MsalError::InvalidConfiguration(_))
+    ));
+}
+
+#[tokio::test]
+async fn sign_out_removes_accounts_that_no_longer_match_the_authority() {
+    let application = brokered_app().await;
+    let mut foreign = account("login.microsoftonline.us");
+    foreign.tenant_id = OTHER_TENANT.into();
+    application.sign_out(&foreign).await.unwrap();
 }
