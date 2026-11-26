@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Device-code initiation omits `client_info=1`, which can cause Entra to reject
+  `/devicecode` requests with AADSTS700052 (`ProfileInfoToken`). Device polling,
+  refresh, authorization-code token exchanges and authorization URLs retain it.
+
 ### Changed
 
 - WAM exposes client/provider/authority-bound account-association snapshots for
@@ -26,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All OAuth requests accept validated extra server parameters and cooperative
   cancellation. `client_session` is transmitted without claiming live server
   enforcement; claims and challenge metadata are preserved without silent retry.
-- Device/login requests obtain `client_info` and OIDC scopes. Refresh preserves
+- User login requests include OIDC scopes; authorization URLs and token
+  exchanges request `client_info`, not device-code initiation. Refresh preserves
   trusted prior identity when realistic responses omit ID tokens or rotation.
   Account, resource tenant, environment, audience, issuer and nonce mismatches
   fail explicitly instead of silently yielding incomplete cached identities.

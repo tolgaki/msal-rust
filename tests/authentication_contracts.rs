@@ -219,11 +219,11 @@ fn extra_parameters_reject_oauth_override_and_allow_client_session() {
 }
 
 #[tokio::test]
-async fn device_initiation_and_polling_preserve_claims_session_and_client_info() {
+async fn device_flow_preserves_claims_session_and_requests_client_info_only_on_polling() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path(format!("/{TENANT}/oauth2/v2.0/devicecode")))
         .and(form_field("claims", CLAIMS)).and(form_field("client_session", "session"))
-        .and(form_field("client_info", "1"))
+        .and(|request: &Request| !url::form_urlencoded::parse(&request.body).any(|(key, _)| key == "client_info"))
         .and(|request: &Request| url::form_urlencoded::parse(&request.body).any(|(key, value)| key == "scope" && value.split_whitespace().any(|scope| scope == "openid")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "device_code":"device", "user_code":"ABCD", "verification_uri":"https://microsoft.com/devicelogin",
@@ -644,6 +644,7 @@ async fn code_exchange_checks_nonce_and_pkce() {
     Mock::given(method("POST"))
         .and(path(token_path()))
         .and(form_field("code_verifier", "verifier"))
+        .and(form_field("client_info", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(user_response(claims)))
         .expect(1)
         .mount(&server)

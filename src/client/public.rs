@@ -481,7 +481,6 @@ impl PublicClientApplication {
         let mut init_params = vec![
             ("client_id", self.state.config.auth.client_id.as_str()),
             ("scope", &scope_str),
-            ("client_info", "1"),
         ];
         crate::request::append_request_parameters(
             &mut init_params,
