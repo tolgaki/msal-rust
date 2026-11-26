@@ -11,7 +11,9 @@ use crate::error::{MsalError, Result};
 
 /// Build a [`reqwest::Client`] configured from MSAL HTTP settings.
 pub fn build_http_client(config: &HttpConfig) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_millis(config.timeout_ms));
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_millis(config.timeout_ms));
 
     if let Some(ref proxy_url) = config.proxy {
         let proxy = reqwest::Proxy::all(proxy_url)
@@ -65,14 +67,31 @@ pub async fn post_token_request(
         if error == "authorization_pending" {
             return Err(MsalError::AuthorizationPending);
         }
-        if error == "expired_token" || description.contains("expired") {
+        if error == "slow_down" {
+            return Err(MsalError::SlowDown);
+        }
+        if error == "expired_token" {
             return Err(MsalError::DeviceCodeExpired);
         }
         if error == "interaction_required"
             || error == "consent_required"
             || error == "login_required"
+            // As in MSAL, invalid_grant (expired/revoked refresh token, password
+            // change, wrong ROPC credentials, ...) means the user must sign in
+            // again, except for suberrors that no interaction can resolve.
+            || (error == "invalid_grant"
+                && !matches!(
+                    suberror.as_deref(),
+                    Some("client_mismatch" | "protection_policy_required")
+                ))
         {
-            return Err(MsalError::InteractionRequired(description));
+            return Err(MsalError::InteractionRequiredWithClaims {
+                error,
+                description,
+                correlation_id,
+                claims,
+                suberror,
+            });
         }
 
         return Err(MsalError::ServerError {
@@ -85,4 +104,21 @@ pub async fn post_token_request(
     }
 
     Ok(body)
+}
+
+/// Race the entire operation (including response body and sleeps) against cancellation.
+pub(crate) async fn cancellable<T>(
+    token: Option<&crate::request::CancellationToken>,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if let Some(token) = token {
+        token.check_cancelled()?;
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err(MsalError::OperationCancelled),
+            result = future => result,
+        }
+    } else {
+        future.await
+    }
 }

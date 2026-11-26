@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "http://localhost:3000/redirect".into(),
     );
     request.code_verifier = Some(pkce.verifier);
+    request.nonce = Some(pkce.nonce);
 
     let result = app.acquire_token_by_code(request).await?;
 

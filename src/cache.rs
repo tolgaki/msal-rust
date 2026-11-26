@@ -1,13 +1,7 @@
-//! In-memory token cache.
+//! In-memory, client/account/tenant/environment/request-context isolated cache.
 //!
-//! The [`TokenCache`] stores access tokens, refresh tokens, and account
-//! information in memory. It is used automatically by
-//! [`PublicClientApplication`](crate::PublicClientApplication) and
-//! [`ConfidentialClientApplication`](crate::ConfidentialClientApplication)
-//! to avoid unnecessary token endpoint calls.
-//!
-//! Access tokens are considered expired 5 minutes before their actual
-//! expiration to account for clock skew.
+//! Snapshots are plaintext secret-bearing values. The caller owns protected
+//! persistence, integrity, concurrency and deletion; this crate writes no files.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -16,204 +10,405 @@ use crate::account::AccountInfo;
 use crate::error::{MsalError, Result};
 use crate::response::AuthenticationResult;
 
-/// Cache key for access token lookups.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct AccessTokenKey {
-    home_account_id: String,
-    environment: String,
-    scope_set: String,
-    tenant_id: String,
+    account: String,
+    scopes: String,
+    context: String,
 }
 
-/// Cached access token entry.
-#[derive(Debug, Clone)]
-struct AccessTokenEntry {
-    access_token: String,
-    expires_on: i64,
-    ext_expires_on: Option<i64>,
-    scopes: Vec<String>,
-    token_type: String,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedToken {
+    result: AuthenticationResult,
+    context: String,
 }
 
-/// Cached refresh token entry.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for debugging and future serialization.
-struct RefreshTokenEntry {
-    refresh_token: String,
-    home_account_id: String,
-    environment: String,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedRefreshToken {
+    account: AccountInfo,
+    token: String,
+    context: String,
 }
 
-/// Thread-safe in-memory token cache.
+/// Serializable in-memory snapshot, not a secret-file or keychain format.
 ///
-/// All methods acquire the internal lock for the shortest possible duration.
-/// The cache is safe to share across threads via `Arc`.
+/// Import only integrity-protected snapshots belonging to this client. Tokens
+/// and account metadata in a snapshot are trusted caller state, not revalidated
+/// against the server. No native broker refresh tokens are exported.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TokenCacheSnapshot {
+    client_id: String,
+    tokens: Vec<CachedToken>,
+    refresh_tokens: Vec<CachedRefreshToken>,
+}
+
+#[derive(Debug, Default)]
+struct CacheState {
+    access_tokens: HashMap<AccessTokenKey, CachedToken>,
+    refresh_tokens: HashMap<(String, String), CachedRefreshToken>,
+    accounts: HashMap<String, AccountInfo>,
+}
+
+/// A single lock makes save, import, export and removal atomic in this process.
 #[derive(Debug)]
 pub struct TokenCache {
-    access_tokens: RwLock<HashMap<AccessTokenKey, AccessTokenEntry>>,
-    refresh_tokens: RwLock<HashMap<String, RefreshTokenEntry>>,
-    accounts: RwLock<HashMap<String, AccountInfo>>,
+    client_id: String,
+    state: RwLock<CacheState>,
 }
 
-fn lock_write_err() -> MsalError {
+fn lock_error() -> MsalError {
     MsalError::CacheError("lock poisoned".into())
 }
 
+/// OIDC scopes the server adds to login responses; they never select a resource token.
+fn is_oidc_scope(scope: &str) -> bool {
+    matches!(scope, "openid" | "profile" | "offline_access" | "email")
+}
+
+fn normalized_scopes(scopes: &[String]) -> std::collections::BTreeSet<String> {
+    scopes
+        .iter()
+        .map(|s| s.to_lowercase())
+        .filter(|scope| !is_oidc_scope(scope))
+        .collect()
+}
+
+fn scope_key(scopes: &[String]) -> String {
+    normalized_scopes(scopes)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether a cached token granted for `cached` scopes satisfies `requested`.
+///
+/// The server may return more scopes than were requested (for example, other
+/// consented scopes of the same resource), so a superset satisfies the request.
+fn scopes_satisfy(
+    cached: &std::collections::BTreeSet<String>,
+    requested: &std::collections::BTreeSet<String>,
+) -> bool {
+    if requested.is_empty() {
+        cached.is_empty()
+    } else {
+        requested.is_subset(cached)
+    }
+}
+
+/// Cache partition for a request.
+///
+/// Access tokens are partitioned by claims and opaque extra parameters, so a
+/// claims challenge never reuses a token issued without it. Refresh tokens are
+/// partitioned only by the extra parameters (e.g. `client_session`): claims are a
+/// per-request challenge that must be redeemable with the account's existing
+/// refresh token. Neither partition proves server-side session enforcement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CacheContext {
+    access: String,
+    refresh: String,
+}
+
+/// Extra parameters that only steer the sign-in UI or account picker. They do
+/// not change what a token represents, so they never partition the cache.
+fn is_ui_hint_parameter(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "login_hint"
+            | "domain_hint"
+            | "prompt"
+            | "ui_locales"
+            | "display"
+            | "max_age"
+            | "msafed"
+            | "instance_aware"
+            | "sid"
+    )
+}
+
+pub(crate) fn request_context(
+    claims: &Option<String>,
+    extra: &std::collections::BTreeMap<String, String>,
+) -> CacheContext {
+    let extra: std::collections::BTreeMap<&String, &String> = extra
+        .iter()
+        .filter(|(key, _)| !is_ui_hint_parameter(key))
+        .collect();
+    let encode = |claims: &Option<String>| {
+        if claims.is_none() && extra.is_empty() {
+            String::new()
+        } else {
+            serde_json::json!([claims, extra]).to_string()
+        }
+    };
+    CacheContext {
+        access: encode(claims),
+        refresh: encode(&None),
+    }
+}
+
+fn validate_result(result: &AuthenticationResult) -> Result<&AccountInfo> {
+    let account = result
+        .account
+        .as_ref()
+        .ok_or_else(|| MsalError::CacheError("cached user token requires an account".into()))?;
+    account.validate()?;
+    if result
+        .tenant_id
+        .as_deref()
+        .is_some_and(|tenant| !tenant.eq_ignore_ascii_case(&account.tenant_id))
+        || result.access_token.is_empty()
+    {
+        return Err(MsalError::CacheError(
+            "invalid cached token/account identity".into(),
+        ));
+    }
+    Ok(account)
+}
+
+/// Insert an access token under `context`, and its refresh token under
+/// `refresh_context` when one is given.
+fn insert_result(
+    state: &mut CacheState,
+    result: &AuthenticationResult,
+    context: &str,
+    refresh_context: Option<&str>,
+) -> Result<()> {
+    let Some(account) = result.account.as_ref() else {
+        return Ok(());
+    };
+    validate_result(result)?;
+    // PoP acquisition must not satisfy a later bearer-cache lookup.
+    if !result.token_type.eq_ignore_ascii_case("Bearer") {
+        return Ok(());
+    }
+    let account_key = account.cache_key();
+    // Refresh tokens live only in the refresh partition; keeping them in
+    // access-token entries would export superseded refresh tokens.
+    let mut access = result.clone();
+    access.refresh_token = None;
+    state.access_tokens.insert(
+        AccessTokenKey {
+            account: account_key.clone(),
+            scopes: scope_key(&result.scopes),
+            context: context.into(),
+        },
+        CachedToken {
+            result: access,
+            context: context.into(),
+        },
+    );
+    if let (Some(token), Some(refresh_context)) = (&result.refresh_token, refresh_context) {
+        state.refresh_tokens.insert(
+            (account_key.clone(), refresh_context.into()),
+            CachedRefreshToken {
+                account: account.clone(),
+                token: token.clone(),
+                context: refresh_context.into(),
+            },
+        );
+    }
+    state.accounts.insert(account_key, account.clone());
+    Ok(())
+}
+
 impl TokenCache {
-    /// Create an empty token cache.
     pub fn new() -> Self {
+        Self::for_client(String::new())
+    }
+
+    pub(crate) fn for_client(client_id: String) -> Self {
         Self {
-            access_tokens: RwLock::new(HashMap::new()),
-            refresh_tokens: RwLock::new(HashMap::new()),
-            accounts: RwLock::new(HashMap::new()),
+            client_id,
+            state: RwLock::new(CacheState::default()),
         }
     }
 
-    /// Store tokens and account from an [`AuthenticationResult`].
-    ///
-    /// Returns an error if a cache lock is poisoned (indicates a prior panic).
     pub fn save(&self, result: &AuthenticationResult) -> Result<()> {
-        let Some(ref account) = result.account else {
-            return Ok(());
-        };
-
-        let mut normalized_scopes: Vec<String> =
-            result.scopes.iter().map(|s| s.to_lowercase()).collect();
-        normalized_scopes.sort();
-
-        let key = AccessTokenKey {
-            home_account_id: account.home_account_id.clone(),
-            environment: account.environment.clone(),
-            scope_set: normalized_scopes.join(" "),
-            tenant_id: account.tenant_id.clone(),
-        };
-
-        self.access_tokens
-            .write()
-            .map_err(|_| lock_write_err())?
-            .insert(
-                key,
-                AccessTokenEntry {
-                    access_token: result.access_token.clone(),
-                    expires_on: result.expires_on,
-                    ext_expires_on: result.ext_expires_on,
-                    scopes: result.scopes.clone(),
-                    token_type: result.token_type.clone(),
-                },
-            );
-
-        if let Some(ref rt) = result.refresh_token {
-            self.refresh_tokens
-                .write()
-                .map_err(|_| lock_write_err())?
-                .insert(
-                    account.home_account_id.clone(),
-                    RefreshTokenEntry {
-                        refresh_token: rt.clone(),
-                        home_account_id: account.home_account_id.clone(),
-                        environment: account.environment.clone(),
-                    },
-                );
-        }
-
-        self.accounts
-            .write()
-            .map_err(|_| lock_write_err())?
-            .insert(account.cache_key(), account.clone());
-
-        Ok(())
+        self.save_with_context(result, &CacheContext::default())
     }
 
-    /// Look up a cached access token for the given account and scopes.
-    ///
-    /// Returns `None` if no matching token is found or if the token has
-    /// expired (with a 5-minute buffer).
+    pub(crate) fn save_with_context(
+        &self,
+        result: &AuthenticationResult,
+        context: &CacheContext,
+    ) -> Result<()> {
+        insert_result(
+            &mut *self.state.write().map_err(|_| lock_error())?,
+            result,
+            &context.access,
+            Some(&context.refresh),
+        )
+    }
+
+    /// Fallible lookup used by acquisition methods; lock errors are not cache misses.
+    pub fn try_lookup_access_token(
+        &self,
+        account: &AccountInfo,
+        scopes: &[String],
+    ) -> Result<Option<AuthenticationResult>> {
+        self.lookup_with_context(account, scopes, &CacheContext::default())
+    }
+
+    pub(crate) fn lookup_with_context(
+        &self,
+        account: &AccountInfo,
+        scopes: &[String],
+        context: &CacheContext,
+    ) -> Result<Option<AuthenticationResult>> {
+        account.validate()?;
+        let state = self.state.read().map_err(|_| lock_error())?;
+        let account_key = account.cache_key();
+        let requested = normalized_scopes(scopes);
+        let fresh_after = chrono::Utc::now().timestamp() + 300;
+        Ok(state
+            .access_tokens
+            .iter()
+            .filter(|(key, entry)| {
+                key.account == account_key
+                    && key.context == context.access
+                    && entry.result.expires_on > fresh_after
+                    && scopes_satisfy(&normalized_scopes(&entry.result.scopes), &requested)
+            })
+            .map(|(_, entry)| entry)
+            .max_by_key(|entry| entry.result.expires_on)
+            .map(|entry| {
+                let mut result = entry.result.clone();
+                result.refresh_token = None;
+                result
+            }))
+    }
+
+    /// Legacy convenience lookup. Prefer the fallible `try_` API.
     pub fn lookup_access_token(
         &self,
         account: &AccountInfo,
         scopes: &[String],
     ) -> Option<AuthenticationResult> {
-        let mut normalized: Vec<String> = scopes.iter().map(|s| s.to_lowercase()).collect();
-        normalized.sort();
-
-        let key = AccessTokenKey {
-            home_account_id: account.home_account_id.clone(),
-            environment: account.environment.clone(),
-            scope_set: normalized.join(" "),
-            tenant_id: account.tenant_id.clone(),
-        };
-
-        let tokens = self.access_tokens.read().ok()?;
-        let entry = tokens.get(&key)?;
-
-        let now = chrono::Utc::now().timestamp();
-        // 5-minute buffer for clock skew.
-        if entry.expires_on <= now + 300 {
-            return None;
-        }
-
-        Some(AuthenticationResult {
-            access_token: entry.access_token.clone(),
-            id_token: None,
-            scopes: entry.scopes.clone(),
-            expires_on: entry.expires_on,
-            ext_expires_on: entry.ext_expires_on,
-            account: Some(account.clone()),
-            tenant_id: Some(account.tenant_id.clone()),
-            correlation_id: None,
-            token_type: entry.token_type.clone(),
-            refresh_token: None,
-        })
+        self.try_lookup_access_token(account, scopes).ok().flatten()
     }
 
-    /// Look up a cached refresh token for the given account.
-    pub fn lookup_refresh_token(&self, account: &AccountInfo) -> Option<String> {
-        let rts = self.refresh_tokens.read().ok()?;
-        rts.get(&account.home_account_id)
-            .map(|e| e.refresh_token.clone())
+    pub fn try_lookup_refresh_token(&self, account: &AccountInfo) -> Result<Option<String>> {
+        self.refresh_with_context(account, &CacheContext::default())
     }
 
-    /// Return all cached accounts.
-    pub fn all_accounts(&self) -> Vec<AccountInfo> {
-        self.accounts
+    pub(crate) fn refresh_with_context(
+        &self,
+        account: &AccountInfo,
+        context: &CacheContext,
+    ) -> Result<Option<String>> {
+        account.validate()?;
+        Ok(self
+            .state
             .read()
-            .map(|a| a.values().cloned().collect())
-            .unwrap_or_default()
+            .map_err(|_| lock_error())?
+            .refresh_tokens
+            .get(&(account.cache_key(), context.refresh.clone()))
+            .map(|entry| entry.token.clone()))
     }
 
-    /// Remove an account and all associated tokens from the cache.
+    /// Legacy convenience lookup. Prefer the fallible `try_` API.
+    pub fn lookup_refresh_token(&self, account: &AccountInfo) -> Option<String> {
+        self.try_lookup_refresh_token(account).ok().flatten()
+    }
+
+    pub fn try_all_accounts(&self) -> Result<Vec<AccountInfo>> {
+        Ok(self
+            .state
+            .read()
+            .map_err(|_| lock_error())?
+            .accounts
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    /// Legacy convenience enumeration. Prefer the fallible `try_` API.
+    pub fn all_accounts(&self) -> Vec<AccountInfo> {
+        self.try_all_accounts().unwrap_or_default()
+    }
+
+    /// Atomically remove this account in this tenant and environment, but not
+    /// the same user's other (guest) tenants.
+    ///
+    /// Matching ignores `local_account_id`, so an `AccountInfo` built from a
+    /// different local identifier (e.g. `sub` instead of `oid`) still removes it.
     pub fn remove_account(&self, account: &AccountInfo) -> Result<()> {
-        let cache_key = account.cache_key();
-
-        self.accounts
-            .write()
-            .map_err(|_| lock_write_err())?
-            .remove(&cache_key);
-
-        self.access_tokens
-            .write()
-            .map_err(|_| lock_write_err())?
-            .retain(|k, _| k.home_account_id != account.home_account_id);
-
-        self.refresh_tokens
-            .write()
-            .map_err(|_| lock_write_err())?
-            .remove(&account.home_account_id);
-
+        let matches = |other: &AccountInfo| {
+            other.home_account_id == account.home_account_id
+                && other.tenant_id.eq_ignore_ascii_case(&account.tenant_id)
+                && crate::authority::environments_equivalent(
+                    &other.environment,
+                    &account.environment,
+                )
+        };
+        let mut state = self.state.write().map_err(|_| lock_error())?;
+        let mut keys: std::collections::HashSet<String> = state
+            .accounts
+            .iter()
+            .filter(|(_, other)| matches(other))
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.extend(
+            state
+                .refresh_tokens
+                .values()
+                .filter(|entry| matches(&entry.account))
+                .map(|entry| entry.account.cache_key()),
+        );
+        keys.insert(account.cache_key());
+        state.accounts.retain(|key, _| !keys.contains(key));
+        state
+            .access_tokens
+            .retain(|entry, _| !keys.contains(&entry.account));
+        state
+            .refresh_tokens
+            .retain(|(account, _), _| !keys.contains(account));
         Ok(())
     }
 
-    /// Remove all tokens and accounts from the cache.
     pub fn clear(&self) -> Result<()> {
-        self.access_tokens
-            .write()
-            .map_err(|_| lock_write_err())?
-            .clear();
-        self.refresh_tokens
-            .write()
-            .map_err(|_| lock_write_err())?
-            .clear();
-        self.accounts.write().map_err(|_| lock_write_err())?.clear();
+        *self.state.write().map_err(|_| lock_error())? = CacheState::default();
+        Ok(())
+    }
+
+    pub fn export(&self) -> Result<TokenCacheSnapshot> {
+        let state = self.state.read().map_err(|_| lock_error())?;
+        Ok(TokenCacheSnapshot {
+            client_id: self.client_id.clone(),
+            tokens: state.access_tokens.values().cloned().collect(),
+            refresh_tokens: state.refresh_tokens.values().cloned().collect(),
+        })
+    }
+
+    /// Atomically replace cache state, rejecting wrong-client or malformed data.
+    pub fn import(&self, snapshot: TokenCacheSnapshot) -> Result<()> {
+        if snapshot.client_id != self.client_id {
+            return Err(MsalError::CacheError(
+                "snapshot belongs to a different client".into(),
+            ));
+        }
+        let mut state = CacheState::default();
+        for entry in snapshot.tokens {
+            validate_result(&entry.result)?;
+            // Refresh tokens come only from the snapshot's own refresh list,
+            // which holds the newest token for each partition.
+            insert_result(&mut state, &entry.result, &entry.context, None)?;
+        }
+        for entry in snapshot.refresh_tokens {
+            entry.account.validate()?;
+            if entry.token.is_empty() {
+                return Err(MsalError::CacheError(
+                    "empty refresh token in snapshot".into(),
+                ));
+            }
+            state
+                .accounts
+                .insert(entry.account.cache_key(), entry.account.clone());
+            state
+                .refresh_tokens
+                .insert((entry.account.cache_key(), entry.context.clone()), entry);
+        }
+        *self.state.write().map_err(|_| lock_error())? = state;
         Ok(())
     }
 }
@@ -259,14 +454,14 @@ mod tests {
     fn save_and_lookup_access_token() {
         let cache = TokenCache::new();
         let account = test_account();
-        let result = test_result(&account);
-
-        cache.save(&result).unwrap();
-
-        let scopes = vec!["user.read".into()];
-        let cached = cache.lookup_access_token(&account, &scopes);
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap().access_token, "access-token-value");
+        cache.save(&test_result(&account)).unwrap();
+        assert_eq!(
+            cache
+                .lookup_access_token(&account, &["user.read".into()])
+                .unwrap()
+                .access_token,
+            "access-token-value"
+        );
     }
 
     #[test]
@@ -274,35 +469,30 @@ mod tests {
         let cache = TokenCache::new();
         let account = test_account();
         let mut result = test_result(&account);
-        result.expires_on = chrono::Utc::now().timestamp() - 1; // Already expired.
-
+        result.expires_on = chrono::Utc::now().timestamp() - 1;
         cache.save(&result).unwrap();
-
-        let scopes = vec!["user.read".into()];
-        assert!(cache.lookup_access_token(&account, &scopes).is_none());
+        assert!(cache
+            .lookup_access_token(&account, &result.scopes)
+            .is_none());
     }
 
     #[test]
     fn lookup_refresh_token() {
         let cache = TokenCache::new();
         let account = test_account();
-        let result = test_result(&account);
-
-        cache.save(&result).unwrap();
-
-        let rt = cache.lookup_refresh_token(&account);
-        assert_eq!(rt.as_deref(), Some("refresh-token-value"));
+        cache.save(&test_result(&account)).unwrap();
+        assert_eq!(
+            cache.lookup_refresh_token(&account).as_deref(),
+            Some("refresh-token-value")
+        );
     }
 
     #[test]
     fn remove_account_clears_tokens() {
         let cache = TokenCache::new();
         let account = test_account();
-        let result = test_result(&account);
-
-        cache.save(&result).unwrap();
+        cache.save(&test_result(&account)).unwrap();
         assert_eq!(cache.all_accounts().len(), 1);
-
         cache.remove_account(&account).unwrap();
         assert!(cache.all_accounts().is_empty());
         assert!(cache.lookup_refresh_token(&account).is_none());
@@ -311,12 +501,25 @@ mod tests {
     #[test]
     fn clear_empties_everything() {
         let cache = TokenCache::new();
-        let account = test_account();
-        let result = test_result(&account);
-
-        cache.save(&result).unwrap();
+        cache.save(&test_result(&test_account())).unwrap();
         cache.clear().unwrap();
-
         assert!(cache.all_accounts().is_empty());
+    }
+
+    #[test]
+    fn poisoned_lock_is_an_error_not_a_miss_for_fallible_api() {
+        let cache = TokenCache::new();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = cache.state.write().unwrap();
+            panic!("poison test");
+        });
+        assert!(matches!(
+            cache.try_all_accounts(),
+            Err(MsalError::CacheError(_))
+        ));
+        assert!(matches!(
+            cache.try_lookup_refresh_token(&test_account()),
+            Err(MsalError::CacheError(_))
+        ));
     }
 }

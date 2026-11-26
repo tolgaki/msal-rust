@@ -75,6 +75,7 @@ impl Authority {
         let url = Url::parse(authority_url)
             .map_err(|e| MsalError::AuthorityValidation(format!("invalid authority URL: {e}")))?;
 
+        Self::validate_authority_url(&url)?;
         let authority_type = detect_authority_type(&url);
         let tenant = extract_tenant(&url);
 
@@ -120,6 +121,7 @@ impl Authority {
     pub fn from_url_no_discovery(authority_url: &str) -> Result<Self> {
         let url = Url::parse(authority_url)
             .map_err(|e| MsalError::AuthorityValidation(format!("invalid authority URL: {e}")))?;
+        Self::validate_authority_url(&url)?;
 
         let authority_type = detect_authority_type(&url);
         let tenant = extract_tenant(&url);
@@ -132,20 +134,150 @@ impl Authority {
             authorization_endpoint: format!("{base}/oauth2/v2.0/authorize"),
             token_endpoint: format!("{base}/oauth2/v2.0/token"),
             device_code_endpoint: format!("{base}/oauth2/v2.0/devicecode"),
-            issuer: format!("https://login.microsoftonline.com/{tenant}/v2.0"),
+            issuer: format!("{base}/v2.0"),
         })
+    }
+
+    pub(crate) fn validate_authority_url(url: &Url) -> Result<()> {
+        let loopback = matches!(
+            url.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        );
+        if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.host_str().is_none()
+        {
+            return Err(MsalError::AuthorityValidation("authority must be HTTPS without credentials, query or fragment (HTTP loopback is test/development only)".into()));
+        }
+        Ok(())
+    }
+
+    /// Whether identities for this authority must be bound to a tenant ID that
+    /// only discovery can supply: an Entra or CIAM authority whose tenant is a
+    /// domain name (`contoso.onmicrosoft.com`) rather than a GUID or one of the
+    /// multi-tenant aliases.
+    pub(crate) fn needs_tenant_resolution(&self) -> bool {
+        matches!(
+            self.authority_type,
+            AuthorityType::Aad | AuthorityType::Ciam
+        ) && !matches!(
+            self.tenant.to_ascii_lowercase().as_str(),
+            "common" | "organizations" | "consumers"
+        ) && uuid::Uuid::parse_str(&self.tenant).is_err()
+    }
+
+    /// Return a copy of this authority whose `tenant` is the tenant GUID that
+    /// the authority's own v2.0 OpenID configuration names in its issuer.
+    ///
+    /// Endpoints are left unchanged. Tenant validation then compares account
+    /// and ID token tenants with this GUID, so tokens and cached identities
+    /// from another tenant are rejected for domain-name authorities too.
+    pub(crate) async fn resolve_tenant_id(&self, http: &reqwest::Client) -> Result<Self> {
+        let discovery_url = format!(
+            "{}/v2.0/.well-known/openid-configuration",
+            self.canonical_authority.as_str().trim_end_matches('/')
+        );
+        let unresolved = |detail: String| {
+            MsalError::AuthorityMetadataNotFound(format!(
+                "cannot resolve tenant ID for {}: {detail}",
+                self.canonical_authority
+            ))
+        };
+        let response = http.get(&discovery_url).send().await?;
+        if !response.status().is_success() {
+            return Err(unresolved(format!("HTTP {}", response.status())));
+        }
+        let config: OpenIdConfig = response.json().await?;
+        let issuer = Url::parse(&config.issuer)
+            .map_err(|_| unresolved("discovery issuer is not a URL".into()))?;
+        let mut segments = issuer
+            .path_segments()
+            .map(|segments| segments.filter(|segment| !segment.is_empty()))
+            .ok_or_else(|| unresolved("discovery issuer has no path".into()))?;
+        let tenant_id = match (segments.next(), segments.next(), segments.next()) {
+            (Some(tenant), Some("v2.0"), None) if uuid::Uuid::parse_str(tenant).is_ok() => {
+                tenant.to_ascii_lowercase()
+            }
+            _ => return Err(unresolved("discovery issuer names no tenant GUID".into())),
+        };
+        let authority_host = self.canonical_authority.host_str().unwrap_or_default();
+        let issuer_host = issuer.host_str().unwrap_or_default();
+        let host_matches = environments_equivalent(issuer_host, authority_host)
+            || (self.authority_type == AuthorityType::Ciam
+                && issuer_host.eq_ignore_ascii_case(&format!("{tenant_id}.ciamlogin.com")));
+        if issuer.scheme() != "https" || !host_matches {
+            return Err(unresolved(
+                "discovery issuer host differs from authority".into(),
+            ));
+        }
+        let mut resolved = self.clone();
+        resolved.tenant = tenant_id;
+        Ok(resolved)
+    }
+
+    /// Whether `other` names this same authority, ignoring host case, known
+    /// public-cloud host aliases, tenant case and a trailing slash.
+    pub(crate) fn is_same_authority(&self, other: &str) -> Result<bool> {
+        let other = Url::parse(other)
+            .map_err(|e| MsalError::AuthorityValidation(format!("invalid authority URL: {e}")))?;
+        let this = &self.canonical_authority;
+        let normalized_path = |url: &Url| url.path().trim_end_matches('/').to_ascii_lowercase();
+        Ok(this.scheme() == other.scheme()
+            && this.port_or_known_default() == other.port_or_known_default()
+            && environments_equivalent(
+                this.host_str().unwrap_or_default(),
+                other.host_str().unwrap_or_default(),
+            )
+            && normalized_path(this) == normalized_path(&other)
+            && other.query().is_none()
+            && other.fragment().is_none())
     }
 }
 
-fn detect_authority_type(url: &Url) -> AuthorityType {
-    let host = url.host_str().unwrap_or_default();
-    let path = url.path();
+/// Host groups that Entra ID treats as one cloud environment. The first host
+/// of each group is its canonical (preferred) environment.
+const CLOUD_ALIAS_GROUPS: &[&[&str]] = &[
+    &[
+        "login.microsoftonline.com",
+        "login.windows.net",
+        "login.microsoft.com",
+        "sts.windows.net",
+    ],
+    &["login.partner.microsoftonline.cn", "login.chinacloudapi.cn"],
+    &["login.microsoftonline.us", "login.usgovcloudapi.net"],
+];
 
-    if host.contains(".b2clogin.com") || path.contains("/tfp/") {
+/// Canonical, lowercase environment for cache keys and account identity.
+pub(crate) fn canonical_environment(host: &str) -> String {
+    CLOUD_ALIAS_GROUPS
+        .iter()
+        .find(|group| group.iter().any(|alias| alias.eq_ignore_ascii_case(host)))
+        .map_or_else(|| host.to_ascii_lowercase(), |group| group[0].to_string())
+}
+
+/// Whether two environments name the same cloud (case-insensitive, alias-aware).
+pub(crate) fn environments_equivalent(left: &str, right: &str) -> bool {
+    canonical_environment(left) == canonical_environment(right)
+}
+
+fn detect_authority_type(url: &Url) -> AuthorityType {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    // Match the first path segment exactly: substring matching would classify
+    // e.g. `/adfscorp.onmicrosoft.com` as ADFS and skip tenant checks.
+    let first_segment = url
+        .path_segments()
+        .and_then(|mut segments| segments.next())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if host.ends_with(".b2clogin.com") || first_segment == "tfp" {
         AuthorityType::AadB2C
-    } else if host.contains(".ciamlogin.com") {
+    } else if host.ends_with(".ciamlogin.com") {
         AuthorityType::Ciam
-    } else if path.contains("/adfs") {
+    } else if first_segment == "adfs" {
         AuthorityType::Adfs
     } else {
         AuthorityType::Aad

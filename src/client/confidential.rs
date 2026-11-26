@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::account::AccountInfo;
-use crate::client::AppState;
+use crate::client::{AppState, ExchangeOptions};
 use crate::config::{ClientCredential, Configuration};
 use crate::error::{MsalError, Result};
 use crate::request::{
@@ -49,16 +49,31 @@ impl ConfidentialClientApplication {
             ("scope", scope_str.as_str()),
         ];
         append_credential(&self.state.config.auth.client_credential, &mut params)?;
+        crate::request::append_request_parameters(
+            &mut params,
+            &request.claims,
+            &request.correlation_id,
+            &request.extra_query_parameters,
+        )?;
 
         // Client credential flow has no user — don't cache (no account key).
-        let body = crate::network::post_token_request(
-            &self.state.http,
-            &self.state.authority.token_endpoint,
-            &params,
+        let body = crate::network::cancellable(
+            request.cancellation_token.as_ref(),
+            crate::network::post_token_request(
+                &self.state.http,
+                &self.state.authority.token_endpoint,
+                &params,
+            ),
         )
         .await?;
         let token_resp: crate::response::TokenResponse = serde_json::from_value(body)?;
-        Ok(token_resp.into_authentication_result())
+        token_resp.into_authentication_result(
+            &self.state.authority,
+            &self.state.config.auth.client_id,
+            None,
+            None,
+            &request.scopes,
+        )
     }
 
     /// Exchange an authorization code for tokens.
@@ -66,7 +81,7 @@ impl ConfidentialClientApplication {
         &self,
         request: AuthorizationCodeRequest,
     ) -> Result<AuthenticationResult> {
-        let scope_str = request.scopes.join(" ");
+        let scope_str = crate::request::user_scopes(&request.scopes).join(" ");
         let mut params = vec![
             ("client_id", self.state.config.auth.client_id.as_str()),
             ("grant_type", "authorization_code"),
@@ -79,7 +94,20 @@ impl ConfidentialClientApplication {
         }
         append_credential(&self.state.config.auth.client_credential, &mut params)?;
 
-        self.state.exchange_and_cache(&params).await
+        self.state
+            .exchange_and_cache(
+                &params,
+                ExchangeOptions {
+                    account: None,
+                    nonce: request.nonce.as_deref(),
+                    scopes: &request.scopes,
+                    claims: &request.claims,
+                    correlation_id: &request.correlation_id,
+                    extra: &request.extra_query_parameters,
+                    cancellation: request.cancellation_token.as_ref(),
+                },
+            )
+            .await
     }
 
     /// Acquire a token on behalf of a user (OBO flow).
@@ -97,7 +125,20 @@ impl ConfidentialClientApplication {
         ];
         append_credential(&self.state.config.auth.client_credential, &mut params)?;
 
-        self.state.exchange_and_cache(&params).await
+        self.state
+            .exchange_and_cache(
+                &params,
+                ExchangeOptions {
+                    account: None,
+                    nonce: None,
+                    scopes: &request.scopes,
+                    claims: &request.claims,
+                    correlation_id: &request.correlation_id,
+                    extra: &request.extra_query_parameters,
+                    cancellation: request.cancellation_token.as_ref(),
+                },
+            )
+            .await
     }
 
     /// Acquire a token silently from the cache, falling back to refresh token.
@@ -105,18 +146,34 @@ impl ConfidentialClientApplication {
         &self,
         request: SilentFlowRequest,
     ) -> Result<AuthenticationResult> {
+        crate::request::validate_extra_query_parameters(&request.extra_query_parameters)?;
+        crate::request::validate_claims(&request.claims)?;
+        if let Some(token) = &request.cancellation_token {
+            token.check_cancelled()?;
+        }
+        let authority = self
+            .state
+            .validation_authority(request.cancellation_token.as_ref())
+            .await?;
+        crate::response::validate_account_authority(&request.account, authority)?;
+        let context =
+            crate::cache::request_context(&request.claims, &request.extra_query_parameters);
         if !request.force_refresh {
-            if let Some(cached) = self
-                .state
-                .cache
-                .lookup_access_token(&request.account, &request.scopes)
+            if let Some(cached) =
+                self.state
+                    .cache
+                    .lookup_with_context(&request.account, &request.scopes, &context)?
             {
                 return Ok(cached);
             }
         }
 
-        if let Some(rt) = self.state.cache.lookup_refresh_token(&request.account) {
-            let scope_str = request.scopes.join(" ");
+        if let Some(rt) = self
+            .state
+            .cache
+            .refresh_with_context(&request.account, &context)?
+        {
+            let scope_str = crate::request::user_scopes(&request.scopes).join(" ");
             let mut params = vec![
                 ("client_id", self.state.config.auth.client_id.as_str()),
                 ("grant_type", "refresh_token"),
@@ -125,7 +182,21 @@ impl ConfidentialClientApplication {
             ];
             append_credential(&self.state.config.auth.client_credential, &mut params)?;
 
-            return self.state.exchange_and_cache(&params).await;
+            return self
+                .state
+                .exchange_and_cache(
+                    &params,
+                    ExchangeOptions {
+                        account: Some(&request.account),
+                        nonce: None,
+                        scopes: &request.scopes,
+                        claims: &request.claims,
+                        correlation_id: &request.correlation_id,
+                        extra: &request.extra_query_parameters,
+                        cancellation: request.cancellation_token.as_ref(),
+                    },
+                )
+                .await;
         }
 
         Err(MsalError::InteractionRequired(
@@ -147,12 +218,37 @@ impl ConfidentialClientApplication {
         ];
         append_credential(&self.state.config.auth.client_credential, &mut params)?;
 
-        self.state.exchange_and_cache(&params).await
+        self.state
+            .exchange_and_cache(
+                &params,
+                ExchangeOptions {
+                    account: request.account.as_ref(),
+                    nonce: None,
+                    scopes: &request.scopes,
+                    claims: &request.claims,
+                    correlation_id: &request.correlation_id,
+                    extra: &request.extra_query_parameters,
+                    cancellation: request.cancellation_token.as_ref(),
+                },
+            )
+            .await
     }
 
     /// Return all accounts in the token cache.
     pub fn all_accounts(&self) -> Vec<AccountInfo> {
         self.state.cache.all_accounts()
+    }
+
+    pub fn try_all_accounts(&self) -> Result<Vec<AccountInfo>> {
+        self.state.cache.try_all_accounts()
+    }
+
+    pub fn export_cache(&self) -> Result<crate::cache::TokenCacheSnapshot> {
+        self.state.cache.export()
+    }
+
+    pub fn import_cache(&self, snapshot: crate::cache::TokenCacheSnapshot) -> Result<()> {
+        self.state.cache.import(snapshot)
     }
 
     /// Remove an account from the cache.

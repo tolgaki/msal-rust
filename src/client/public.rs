@@ -3,7 +3,7 @@ use tokio::sync::RwLock;
 
 use crate::account::AccountInfo;
 use crate::broker::{BrokerSignOutRequest, BrokerTokenRequest, NativeBroker};
-use crate::client::AppState;
+use crate::client::{AppState, ExchangeOptions};
 use crate::config::Configuration;
 use crate::crypto::PkceParams;
 use crate::error::{MsalError, Result};
@@ -54,7 +54,7 @@ impl PublicClientApplication {
     /// # let config = Configuration::builder("id").build();
     /// let app = PublicClientApplication::new(config)?;
     ///
-    /// #[cfg(target_os = "windows")]
+    /// #[cfg(all(target_os = "windows", feature = "broker-wam"))]
     /// {
     ///     let broker = msal::broker::wam::WamBroker::new().await?;
     ///     app.set_broker(Box::new(broker)).await;
@@ -85,13 +85,41 @@ impl PublicClientApplication {
         &self,
         request: BrokerTokenRequest,
     ) -> Result<AuthenticationResult> {
+        crate::request::validate_extra_query_parameters(&request.extra_query_parameters)?;
+        crate::request::validate_claims(&request.claims)?;
+        if let Some(token) = &request.cancellation_token {
+            token.check_cancelled()?;
+        }
+        let mut request = request;
+        if let Some(authority) = &request.authority {
+            if !self.state.authority.is_same_authority(authority)? {
+                return Err(MsalError::InvalidConfiguration("broker authority differs from application authority; construct a separate application".into()));
+            }
+        }
+        request.authority = Some(self.state.config.auth.authority.clone());
+        let authority = self
+            .state
+            .validation_authority(request.cancellation_token.as_ref())
+            .await?;
+        if let Some(account) = &request.account {
+            crate::response::validate_account_authority(account, authority)?;
+        }
         let b = self.broker.read().await;
         if let Some(ref broker) = *b {
             if broker.is_available() {
                 let result = broker
                     .acquire_token_interactive(&self.state.config.auth.client_id, &request)
                     .await?;
-                self.state.cache.save(&result)?;
+                self.validate_broker_result(authority, &result, request.account.as_ref())?;
+                if self.state.config.cache.store_in_memory {
+                    self.state.cache.save_with_context(
+                        &result,
+                        &crate::cache::request_context(
+                            &request.claims,
+                            &request.extra_query_parameters,
+                        ),
+                    )?;
+                }
                 return Ok(result);
             }
         }
@@ -113,12 +141,26 @@ impl PublicClientApplication {
         &self,
         request: SilentFlowRequest,
     ) -> Result<AuthenticationResult> {
+        crate::request::validate_extra_query_parameters(&request.extra_query_parameters)?;
+        crate::request::validate_claims(&request.claims)?;
+        if let Some(token) = &request.cancellation_token {
+            token.check_cancelled()?;
+        }
+        // Bind the account to the configured tenant before any cache lookup, so
+        // a cached or imported identity from another tenant is never served.
+        let authority = self
+            .state
+            .validation_authority(request.cancellation_token.as_ref())
+            .await?;
+        crate::response::validate_account_authority(&request.account, authority)?;
+        let context =
+            crate::cache::request_context(&request.claims, &request.extra_query_parameters);
         // 1. Try local cache.
         if !request.force_refresh {
-            if let Some(cached) = self
-                .state
-                .cache
-                .lookup_access_token(&request.account, &request.scopes)
+            if let Some(cached) =
+                self.state
+                    .cache
+                    .lookup_with_context(&request.account, &request.scopes, &context)?
             {
                 return Ok(cached);
             }
@@ -137,26 +179,75 @@ impl PublicClientApplication {
                         window_handle: None,
                         authentication_scheme: Default::default(),
                         pop_params: None,
+                        force_refresh: request.force_refresh,
+                        authority: Some(self.state.config.auth.authority.clone()),
+                        extra_query_parameters: request.extra_query_parameters.clone(),
+                        // Native adapters cannot cancel an in-flight operation and
+                        // reject requests carrying a token. A silent native call shows
+                        // no UI, so cancellation here stops waiting for it and discards
+                        // its result instead.
+                        cancellation_token: None,
                     };
-                    let result = broker
-                        .acquire_token_silent(&self.state.config.auth.client_id, &broker_request)
-                        .await?;
-                    self.state.cache.save(&result)?;
-                    return Ok(result);
+                    let outcome = crate::network::cancellable(
+                        request.cancellation_token.as_ref(),
+                        broker.acquire_token_silent(
+                            &self.state.config.auth.client_id,
+                            &broker_request,
+                        ),
+                    )
+                    .await;
+                    match outcome {
+                        // The broker cannot serve this request (e.g. an account it
+                        // has no native mapping for, or an unsupported option):
+                        // continue with the locally cached refresh token.
+                        Err(MsalError::Unsupported(_)) => {}
+                        outcome => {
+                            let result = outcome?;
+                            self.validate_broker_result(
+                                authority,
+                                &result,
+                                Some(&request.account),
+                            )?;
+                            if self.state.config.cache.store_in_memory {
+                                self.state.cache.save_with_context(&result, &context)?;
+                            }
+                            return Ok(result);
+                        }
+                    }
                 }
             }
         }
 
         // 3. Try refresh token (standard OAuth).
-        if let Some(rt) = self.state.cache.lookup_refresh_token(&request.account) {
-            let scope_str = request.scopes.join(" ");
+        if let Some(rt) = self
+            .state
+            .cache
+            .refresh_with_context(&request.account, &context)?
+        {
+            // Include OIDC scopes so the refresh rotates the refresh token
+            // and returns an ID token that re-validates the account.
+            let scope_str = crate::request::user_scopes(&request.scopes).join(" ");
             let params = [
                 ("client_id", self.state.config.auth.client_id.as_str()),
                 ("grant_type", "refresh_token"),
                 ("refresh_token", rt.as_str()),
                 ("scope", scope_str.as_str()),
             ];
-            return self.state.exchange_and_cache(&params).await;
+            return self
+                .state
+                .exchange_and_cache(
+                    &params,
+                    ExchangeOptions {
+                        account: Some(&request.account),
+                        nonce: None,
+                        scopes: &request.scopes,
+                        claims: &request.claims,
+                        correlation_id: &request.correlation_id,
+                        extra: &request.extra_query_parameters,
+                        cancellation: request.cancellation_token.as_ref(),
+                    },
+                )
+                .await;
         }
 
         Err(MsalError::InteractionRequired(
@@ -168,24 +259,25 @@ impl PublicClientApplication {
     ///
     /// If no broker is configured, only the local token cache is cleared.
     pub async fn sign_out(&self, account: &AccountInfo) -> Result<()> {
-        // Try broker sign-out first.
-        {
-            let b = self.broker.read().await;
-            if let Some(ref broker) = *b {
-                if broker.is_available() {
-                    let sign_out_request = BrokerSignOutRequest {
-                        account: account.clone(),
-                        correlation_id: None,
-                    };
-                    broker
-                        .sign_out(&self.state.config.auth.client_id, &sign_out_request)
-                        .await?;
-                }
+        // Only require a complete identity: removing local state for an account
+        // whose environment/tenant no longer matches the authority must still work.
+        account.validate()?;
+        // Clear local state first, so a failing or unsupported broker sign-out
+        // can never leave cached tokens behind for this account.
+        self.state.cache.remove_account(account)?;
+        let b = self.broker.read().await;
+        if let Some(ref broker) = *b {
+            if broker.is_available() {
+                let sign_out_request = BrokerSignOutRequest {
+                    account: account.clone(),
+                    correlation_id: None,
+                };
+                broker
+                    .sign_out(&self.state.config.auth.client_id, &sign_out_request)
+                    .await?;
             }
         }
-
-        // Clear local cache.
-        self.state.cache.remove_account(account)
+        Ok(())
     }
 
     /// Return all accounts. If a broker is configured, returns broker accounts;
@@ -201,7 +293,38 @@ impl PublicClientApplication {
             }
         }
 
-        Ok(self.state.cache.all_accounts())
+        self.state.cache.try_all_accounts()
+    }
+
+    /// Export plaintext secret-bearing state for caller-owned protected persistence.
+    pub fn export_cache(&self) -> Result<crate::cache::TokenCacheSnapshot> {
+        self.state.cache.export()
+    }
+
+    /// Replace local cache with integrity-protected state for this client.
+    pub fn import_cache(&self, snapshot: crate::cache::TokenCacheSnapshot) -> Result<()> {
+        self.state.cache.import(snapshot)
+    }
+
+    fn validate_broker_result(
+        &self,
+        authority: &crate::authority::Authority,
+        result: &AuthenticationResult,
+        expected: Option<&AccountInfo>,
+    ) -> Result<()> {
+        let account = result
+            .account
+            .as_ref()
+            .ok_or_else(|| MsalError::InvalidToken("broker returned no account".into()))?;
+        crate::response::validate_account_authority(account, authority)?;
+        if result.tenant_id.as_deref() != Some(account.tenant_id.as_str())
+            || expected.is_some_and(|expected| !account.same_identity(expected))
+        {
+            return Err(MsalError::InvalidToken(
+                "broker returned wrong or incomplete tenant/account".into(),
+            ));
+        }
+        Ok(())
     }
 
     // ── Standard OAuth flows (non-brokered) ─────────────────────────────
@@ -216,18 +339,51 @@ impl PublicClientApplication {
         redirect_uri: &str,
         state_param: Option<&str>,
     ) -> Result<(String, PkceParams)> {
+        self.authorization_url_with_options(
+            scopes,
+            redirect_uri,
+            state_param,
+            None,
+            &Default::default(),
+        )
+    }
+
+    /// Build an authorization URL with claims and opaque server parameters.
+    ///
+    /// Copy the returned verifier and nonce to the code exchange request. The
+    /// caller must validate the redirect's state before exchanging its code.
+    pub fn authorization_url_with_options(
+        &self,
+        scopes: &[String],
+        redirect_uri: &str,
+        state_param: Option<&str>,
+        claims: Option<&str>,
+        extra_query_parameters: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(String, PkceParams)> {
+        crate::request::validate_extra_query_parameters(extra_query_parameters)?;
         let pkce = PkceParams::generate();
-        let nonce = crate::crypto::generate_nonce();
+        let scope_str = crate::request::user_scopes(scopes).join(" ");
 
         let mut url = url::Url::parse(&self.state.authority.authorization_endpoint)?;
         url.query_pairs_mut()
             .append_pair("client_id", &self.state.config.auth.client_id)
             .append_pair("response_type", "code")
             .append_pair("redirect_uri", redirect_uri)
-            .append_pair("scope", &scopes.join(" "))
+            .append_pair("scope", &scope_str)
             .append_pair("code_challenge", &pkce.challenge)
             .append_pair("code_challenge_method", pkce.challenge_method)
-            .append_pair("nonce", &nonce);
+            .append_pair("nonce", &pkce.nonce)
+            .append_pair("client_info", "1");
+        let owned_claims = claims.map(String::from);
+        let mut additional = Vec::new();
+        let correlation_id = None;
+        crate::request::append_request_parameters(
+            &mut additional,
+            &owned_claims,
+            &correlation_id,
+            extra_query_parameters,
+        )?;
+        url.query_pairs_mut().extend_pairs(additional);
 
         if let Some(st) = state_param {
             url.query_pairs_mut().append_pair("state", st);
@@ -241,7 +397,25 @@ impl PublicClientApplication {
         &self,
         request: AuthorizationCodeRequest,
     ) -> Result<AuthenticationResult> {
-        let scope_str = request.scopes.join(" ");
+        if request
+            .code_verifier
+            .as_deref()
+            .map_or(true, |verifier| verifier.is_empty())
+        {
+            return Err(MsalError::MissingParameter(
+                "public authorization code flow requires a PKCE verifier".into(),
+            ));
+        }
+        if request
+            .nonce
+            .as_deref()
+            .map_or(true, |nonce| nonce.is_empty())
+        {
+            return Err(MsalError::MissingParameter(
+                "public authorization code flow requires the original authorization nonce".into(),
+            ));
+        }
+        let scope_str = crate::request::user_scopes(&request.scopes).join(" ");
         let mut params: Vec<(&str, &str)> = vec![
             ("client_id", &self.state.config.auth.client_id),
             ("grant_type", "authorization_code"),
@@ -254,7 +428,20 @@ impl PublicClientApplication {
             params.push(("code_verifier", v));
         }
 
-        self.state.exchange_and_cache(&params).await
+        self.state
+            .exchange_and_cache(
+                &params,
+                ExchangeOptions {
+                    account: None,
+                    nonce: request.nonce.as_deref(),
+                    scopes: &request.scopes,
+                    claims: &request.claims,
+                    correlation_id: &request.correlation_id,
+                    extra: &request.extra_query_parameters,
+                    cancellation: request.cancellation_token.as_ref(),
+                },
+            )
+            .await
     }
 
     /// Initiate the device code flow and poll for completion.
@@ -269,29 +456,40 @@ impl PublicClientApplication {
     where
         F: FnOnce(&DeviceCodeInfo),
     {
+        crate::network::cancellable(
+            request.cancellation_token.as_ref(),
+            self.device_code_inner(&request, callback),
+        )
+        .await
+    }
+
+    async fn device_code_inner<F>(
+        &self,
+        request: &DeviceCodeRequest,
+        callback: F,
+    ) -> Result<AuthenticationResult>
+    where
+        F: FnOnce(&DeviceCodeInfo),
+    {
         // Step 1: Initiate device code flow.
-        let scope_str = request.scopes.join(" ");
-        let init_params = [
+        let scope_str = crate::request::user_scopes(&request.scopes).join(" ");
+        let mut init_params = vec![
             ("client_id", self.state.config.auth.client_id.as_str()),
             ("scope", &scope_str),
+            ("client_info", "1"),
         ];
-
-        let resp = self
-            .state
-            .http
-            .post(&self.state.authority.device_code_endpoint)
-            .form(&init_params)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(MsalError::AuthenticationFailed(format!(
-                "device code initiation failed: {body}"
-            )));
-        }
-
-        let body: serde_json::Value = resp.json().await?;
+        crate::request::append_request_parameters(
+            &mut init_params,
+            &request.claims,
+            &request.correlation_id,
+            &request.extra_query_parameters,
+        )?;
+        let body = crate::network::post_token_request(
+            &self.state.http,
+            &self.state.authority.device_code_endpoint,
+            &init_params,
+        )
+        .await?;
 
         let device_code = body["device_code"]
             .as_str()
@@ -301,29 +499,43 @@ impl PublicClientApplication {
             })?
             .to_string();
 
-        let device_info = DeviceCodeInfo {
-            user_code: body["user_code"].as_str().unwrap_or_default().to_string(),
-            device_code,
-            verification_uri: body["verification_uri"]
+        let required_string = |key: &str| -> Result<String> {
+            body[key]
                 .as_str()
-                .unwrap_or_default()
-                .to_string(),
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+                .ok_or_else(|| MsalError::InvalidToken(format!("device response missing {key}")))
+        };
+        let device_info = DeviceCodeInfo {
+            user_code: required_string("user_code")?,
+            device_code,
+            verification_uri: required_string("verification_uri")?,
             message: body["message"].as_str().unwrap_or_default().to_string(),
-            expires_in: body["expires_in"].as_u64().unwrap_or(900),
+            expires_in: body["expires_in"]
+                .as_u64()
+                .filter(|seconds| *seconds > 0)
+                .ok_or_else(|| {
+                    MsalError::InvalidToken("device response missing/invalid expires_in".into())
+                })?,
             interval: body["interval"].as_u64().unwrap_or(5),
         };
 
+        // Step 2: Poll for token (no lock held across awaits).
+        let mut interval = std::time::Duration::from_secs(device_info.interval.max(1));
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(device_info.expires_in))
+            .ok_or_else(|| MsalError::InvalidToken("device response expiration overflow".into()))?;
         callback(&device_info);
 
-        // Step 2: Poll for token (no lock held across awaits).
-        let interval = std::time::Duration::from_secs(device_info.interval);
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(device_info.expires_in);
-
         loop {
-            tokio::time::sleep(interval).await;
+            let next_poll = tokio::time::Instant::now()
+                .checked_add(interval)
+                .ok_or_else(|| {
+                    MsalError::InvalidToken("device polling interval overflow".into())
+                })?;
+            tokio::time::sleep_until(next_poll.min(deadline)).await;
 
-            if std::time::Instant::now() > deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(MsalError::DeviceCodeExpired);
             }
 
@@ -333,9 +545,28 @@ impl PublicClientApplication {
                 ("device_code", &device_info.device_code),
             ];
 
-            match self.state.exchange_and_cache(&poll_params).await {
+            match self
+                .state
+                .exchange_and_cache(
+                    &poll_params,
+                    ExchangeOptions {
+                        account: None,
+                        nonce: None,
+                        scopes: &request.scopes,
+                        claims: &request.claims,
+                        correlation_id: &request.correlation_id,
+                        extra: &request.extra_query_parameters,
+                        cancellation: request.cancellation_token.as_ref(),
+                    },
+                )
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(MsalError::AuthorizationPending) => continue,
+                Err(MsalError::SlowDown) => {
+                    interval += std::time::Duration::from_secs(5);
+                    continue;
+                }
                 Err(MsalError::DeviceCodeExpired) => return Err(MsalError::DeviceCodeExpired),
                 Err(e) => return Err(e),
             }
@@ -354,7 +585,20 @@ impl PublicClientApplication {
             ("refresh_token", request.refresh_token.as_str()),
             ("scope", scope_str.as_str()),
         ];
-        self.state.exchange_and_cache(&params).await
+        self.state
+            .exchange_and_cache(
+                &params,
+                ExchangeOptions {
+                    account: request.account.as_ref(),
+                    nonce: None,
+                    scopes: &request.scopes,
+                    claims: &request.claims,
+                    correlation_id: &request.correlation_id,
+                    extra: &request.extra_query_parameters,
+                    cancellation: request.cancellation_token.as_ref(),
+                },
+            )
+            .await
     }
 
     /// Acquire a token using username and password (ROPC).
@@ -364,7 +608,7 @@ impl PublicClientApplication {
         &self,
         request: UsernamePasswordRequest,
     ) -> Result<AuthenticationResult> {
-        let scope_str = request.scopes.join(" ");
+        let scope_str = crate::request::user_scopes(&request.scopes).join(" ");
         let params = [
             ("client_id", self.state.config.auth.client_id.as_str()),
             ("grant_type", "password"),
@@ -372,7 +616,20 @@ impl PublicClientApplication {
             ("password", request.password.as_str()),
             ("scope", scope_str.as_str()),
         ];
-        self.state.exchange_and_cache(&params).await
+        self.state
+            .exchange_and_cache(
+                &params,
+                ExchangeOptions {
+                    account: None,
+                    nonce: None,
+                    scopes: &request.scopes,
+                    claims: &request.claims,
+                    correlation_id: &request.correlation_id,
+                    extra: &request.extra_query_parameters,
+                    cancellation: request.cancellation_token.as_ref(),
+                },
+            )
+            .await
     }
 
     /// Remove an account from the local cache (does not sign out from broker).

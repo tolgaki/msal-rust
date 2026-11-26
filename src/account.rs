@@ -33,9 +33,40 @@ pub struct AccountInfo {
 }
 
 impl AccountInfo {
-    /// Returns a cache key for this account (`"{home_account_id}-{environment}"`).
+    /// Unambiguous key for the complete tenant/environment-specific identity.
     pub fn cache_key(&self) -> String {
-        format!("{}-{}", self.home_account_id, self.environment)
+        serde_json::json!([
+            self.home_account_id,
+            crate::authority::canonical_environment(&self.environment),
+            self.tenant_id.to_ascii_lowercase(),
+            self.local_account_id
+        ])
+        .to_string()
+    }
+
+    /// Compare security identity, not mutable display name or username.
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.home_account_id == other.home_account_id
+            && self.local_account_id == other.local_account_id
+            && self.tenant_id.eq_ignore_ascii_case(&other.tenant_id)
+            && crate::authority::environments_equivalent(&self.environment, &other.environment)
+    }
+
+    pub(crate) fn validate(&self) -> crate::error::Result<()> {
+        if [
+            &self.home_account_id,
+            &self.local_account_id,
+            &self.environment,
+            &self.tenant_id,
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err(crate::error::MsalError::InvalidToken(
+                "incomplete account identity".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -90,7 +121,13 @@ impl ClientInfo {
             .map_err(|e| {
                 crate::error::MsalError::InvalidToken(format!("invalid client_info base64: {e}"))
             })?;
-        serde_json::from_slice(&decoded).map_err(Into::into)
+        let info: Self = serde_json::from_slice(&decoded)?;
+        if info.uid.trim().is_empty() || info.utid.trim().is_empty() {
+            return Err(crate::error::MsalError::InvalidToken(
+                "empty client_info identity".into(),
+            ));
+        }
+        Ok(info)
     }
 
     /// Build the home account ID (`"{uid}.{utid}"`).
@@ -114,7 +151,10 @@ mod tests {
             name: None,
             id_token_claims: None,
         };
-        assert_eq!(account.cache_key(), "uid.utid-login.microsoftonline.com");
+        assert_eq!(
+            account.cache_key(),
+            r#"["uid.utid","login.microsoftonline.com","tenant","oid"]"#
+        );
     }
 
     #[test]

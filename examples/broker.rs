@@ -30,6 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         window_handle: None, // None for console apps; pass HWND bytes for GUI apps.
         authentication_scheme: AuthenticationScheme::Bearer,
         pop_params: None,
+        force_refresh: false,
+        authority: None,
+        extra_query_parameters: Default::default(),
+        cancellation_token: None,
     };
 
     match app.acquire_token_interactive(request).await {
@@ -45,6 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     force_refresh: false,
                     claims: None,
                     correlation_id: None,
+                    extra_query_parameters: Default::default(),
+                    cancellation_token: None,
                 };
                 let silent_result = app.acquire_token_silent(silent_request).await?;
                 println!("Silent token: {}...", &silent_result.access_token[..20]);
@@ -52,20 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             eprintln!("Interactive auth failed: {e}");
-            eprintln!("Falling back to device code flow...");
-
-            // Manual fallback to device code.
-            let dc_request = msal::request::DeviceCodeRequest {
-                scopes: vec!["user.read".into()],
-                claims: None,
-                correlation_id: None,
-            };
-            let result = app
-                .acquire_token_by_device_code(dc_request, |info| {
-                    println!("{}", info.message);
-                })
-                .await?;
-            println!("Access token: {}...", &result.access_token[..20]);
+            // Do not silently discard broker-only or claims/session guarantees.
+            return Err(e.into());
         }
     }
 
