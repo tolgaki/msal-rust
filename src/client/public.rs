@@ -97,8 +97,12 @@ impl PublicClientApplication {
             }
         }
         request.authority = Some(self.state.config.auth.authority.clone());
+        let authority = self
+            .state
+            .validation_authority(request.cancellation_token.as_ref())
+            .await?;
         if let Some(account) = &request.account {
-            crate::response::validate_account_authority(account, &self.state.authority)?;
+            crate::response::validate_account_authority(account, authority)?;
         }
         let b = self.broker.read().await;
         if let Some(ref broker) = *b {
@@ -106,7 +110,7 @@ impl PublicClientApplication {
                 let result = broker
                     .acquire_token_interactive(&self.state.config.auth.client_id, &request)
                     .await?;
-                self.validate_broker_result(&result, request.account.as_ref())?;
+                self.validate_broker_result(authority, &result, request.account.as_ref())?;
                 if self.state.config.cache.store_in_memory {
                     self.state.cache.save_with_context(
                         &result,
@@ -139,10 +143,16 @@ impl PublicClientApplication {
     ) -> Result<AuthenticationResult> {
         crate::request::validate_extra_query_parameters(&request.extra_query_parameters)?;
         crate::request::validate_claims(&request.claims)?;
-        crate::response::validate_account_authority(&request.account, &self.state.authority)?;
         if let Some(token) = &request.cancellation_token {
             token.check_cancelled()?;
         }
+        // Bind the account to the configured tenant before any cache lookup, so
+        // a cached or imported identity from another tenant is never served.
+        let authority = self
+            .state
+            .validation_authority(request.cancellation_token.as_ref())
+            .await?;
+        crate::response::validate_account_authority(&request.account, authority)?;
         let context =
             crate::cache::request_context(&request.claims, &request.extra_query_parameters);
         // 1. Try local cache.
@@ -193,7 +203,11 @@ impl PublicClientApplication {
                         Err(MsalError::Unsupported(_)) => {}
                         outcome => {
                             let result = outcome?;
-                            self.validate_broker_result(&result, Some(&request.account))?;
+                            self.validate_broker_result(
+                                authority,
+                                &result,
+                                Some(&request.account),
+                            )?;
                             if self.state.config.cache.store_in_memory {
                                 self.state.cache.save_with_context(&result, &context)?;
                             }
@@ -294,6 +308,7 @@ impl PublicClientApplication {
 
     fn validate_broker_result(
         &self,
+        authority: &crate::authority::Authority,
         result: &AuthenticationResult,
         expected: Option<&AccountInfo>,
     ) -> Result<()> {
@@ -301,7 +316,7 @@ impl PublicClientApplication {
             .account
             .as_ref()
             .ok_or_else(|| MsalError::InvalidToken("broker returned no account".into()))?;
-        crate::response::validate_account_authority(account, &self.state.authority)?;
+        crate::response::validate_account_authority(account, authority)?;
         if result.tenant_id.as_deref() != Some(account.tenant_id.as_str())
             || expected.is_some_and(|expected| !account.same_identity(expected))
         {

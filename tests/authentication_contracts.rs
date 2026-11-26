@@ -1217,3 +1217,155 @@ async fn silent_falls_back_to_refresh_token_when_broker_cannot_serve_account() {
         "refreshed"
     );
 }
+
+const DOMAIN: &str = "contoso.onmicrosoft.com";
+
+async fn mount_discovery(server: &MockServer, issuer: String, times: u64) {
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/{DOMAIN}/v2.0/.well-known/openid-configuration"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "authorization_endpoint": format!("{}/{DOMAIN}/oauth2/v2.0/authorize", server.uri()),
+            "token_endpoint": format!("{}/{DOMAIN}/oauth2/v2.0/token", server.uri()),
+            "issuer": issuer,
+        })))
+        .expect(times)
+        .mount(server)
+        .await;
+}
+
+fn domain_app(server: &MockServer) -> PublicClientApplication {
+    refresh_app(server, DOMAIN)
+}
+
+fn import_tokens(application: &PublicClientApplication, identities: &[&AccountInfo]) {
+    let mut snapshot = serde_json::to_value(application.export_cache().unwrap()).unwrap();
+    snapshot["tokens"] = identities
+        .iter()
+        .map(|identity| serde_json::json!({ "result": result(identity), "context": "" }))
+        .collect();
+    application
+        .import_cache(serde_json::from_value(snapshot).unwrap())
+        .unwrap();
+}
+
+#[tokio::test]
+async fn domain_tenant_authority_rejects_cached_accounts_from_other_tenants() {
+    let server = MockServer::start().await;
+    // Discovery runs once per application, not once per request.
+    mount_discovery(&server, format!("https://127.0.0.1/{TENANT}/v2.0"), 1).await;
+    let application = domain_app(&server);
+    let own = account("127.0.0.1");
+    let mut foreign = own.clone();
+    foreign.tenant_id = OTHER_TENANT.into();
+    import_tokens(&application, &[&own, &foreign]);
+
+    let error = application
+        .acquire_token_silent(SilentFlowRequest::new(
+            vec!["user.read".into()],
+            foreign.clone(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MsalError::InvalidToken(_)), "{error:?}");
+    for _ in 0..2 {
+        assert_eq!(
+            application
+                .acquire_token_silent(SilentFlowRequest::new(
+                    vec!["user.read".into()],
+                    own.clone()
+                ))
+                .await
+                .unwrap()
+                .access_token,
+            "access"
+        );
+    }
+    // No token endpoint call was made for either account.
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.method.as_str() == "GET"));
+}
+
+#[tokio::test]
+async fn domain_tenant_authority_rejects_id_tokens_from_other_tenants() {
+    for (tid, accepted) in [(TENANT, true), (OTHER_TENANT, false)] {
+        let server = MockServer::start().await;
+        mount_discovery(&server, format!("https://127.0.0.1/{TENANT}/v2.0"), 1).await;
+        let mut claims = id_claims();
+        claims["tid"] = tid.into();
+        claims["iss"] = format!("https://127.0.0.1/{tid}/v2.0").into();
+        Mock::given(method("POST"))
+            .and(path(format!("/{DOMAIN}/oauth2/v2.0/token")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(user_response(claims)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let application = domain_app(&server);
+        let value = application
+            .acquire_token_by_refresh_token(RefreshTokenRequest::new(
+                "refresh".into(),
+                vec!["user.read".into()],
+            ))
+            .await;
+        assert_eq!(value.is_ok(), accepted, "{tid}: {value:?}");
+        assert_eq!(
+            application.all_accounts().await.unwrap().len(),
+            usize::from(accepted)
+        );
+    }
+}
+
+#[tokio::test]
+async fn domain_tenant_discovery_must_name_a_tenant_guid_on_the_same_host() {
+    for issuer in [
+        format!("https://127.0.0.1/{DOMAIN}/v2.0"),
+        format!("https://attacker.example/{TENANT}/v2.0"),
+        "https://127.0.0.1/common/v2.0".to_string(),
+    ] {
+        let server = MockServer::start().await;
+        mount_discovery(&server, issuer.clone(), 1).await;
+        let application = domain_app(&server);
+        let error = application
+            .acquire_token_silent(SilentFlowRequest::new(
+                vec!["user.read".into()],
+                account("127.0.0.1"),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MsalError::AuthorityMetadataNotFound(_)),
+            "{issuer}: {error:?}"
+        );
+    }
+    // A failed discovery is an error, never a silent pass.
+    let server = MockServer::start().await;
+    let error = domain_app(&server)
+        .acquire_token_silent(SilentFlowRequest::new(
+            vec!["user.read".into()],
+            account("127.0.0.1"),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, MsalError::AuthorityMetadataNotFound(_)),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn guid_and_multi_tenant_authorities_skip_discovery() {
+    let server = MockServer::start().await;
+    let application = app(&server);
+    let own = account("127.0.0.1");
+    import_tokens(&application, &[&own]);
+    application
+        .acquire_token_silent(SilentFlowRequest::new(vec!["user.read".into()], own))
+        .await
+        .unwrap();
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

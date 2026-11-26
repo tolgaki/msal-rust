@@ -36,7 +36,11 @@ pub(crate) struct AppState {
     pub config: Configuration,
     pub http: reqwest::Client,
     pub cache: TokenCache,
+    /// Configured authority; its endpoints are used for every request.
     pub authority: Authority,
+    /// The configured authority with a domain-name tenant replaced by its
+    /// discovered tenant GUID, resolved once on first use.
+    tenant_authority: tokio::sync::OnceCell<Authority>,
 }
 
 impl AppState {
@@ -49,7 +53,29 @@ impl AppState {
             http,
             cache,
             authority,
+            tenant_authority: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// The authority to validate identities against.
+    ///
+    /// For a domain-name tenant authority this is resolved through discovery
+    /// (one network request per application), so that accounts, cached
+    /// tokens and ID tokens from other tenants are rejected. Otherwise it is
+    /// the configured authority.
+    pub async fn validation_authority(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<&Authority> {
+        if !self.authority.needs_tenant_resolution() {
+            return Ok(&self.authority);
+        }
+        crate::network::cancellable(
+            cancellation,
+            self.tenant_authority
+                .get_or_try_init(|| self.authority.resolve_tenant_id(&self.http)),
+        )
+        .await
     }
 
     /// Exchange token endpoint parameters for an [`AuthenticationResult`],
@@ -59,16 +85,17 @@ impl AppState {
         params: &[(&str, &str)],
         options: ExchangeOptions<'_>,
     ) -> Result<AuthenticationResult> {
+        let base = self.validation_authority(options.cancellation).await?;
         let authority = match options.account {
             Some(account) => {
-                crate::response::validate_account_authority(account, &self.authority)?;
-                if self.authority.authority_type == crate::authority::AuthorityType::Aad
+                crate::response::validate_account_authority(account, base)?;
+                if base.authority_type == crate::authority::AuthorityType::Aad
                     && matches!(
-                        self.authority.tenant.as_str(),
+                        base.tenant.as_str(),
                         "common" | "organizations" | "consumers"
                     )
                 {
-                    let mut url = self.authority.canonical_authority.clone();
+                    let mut url = base.canonical_authority.clone();
                     url.path_segments_mut()
                         .map_err(|_| {
                             crate::error::MsalError::AuthorityValidation(
@@ -79,10 +106,10 @@ impl AppState {
                         .push(&account.tenant_id);
                     Authority::from_url_no_discovery(url.as_str())?
                 } else {
-                    self.authority.clone()
+                    base.clone()
                 }
             }
-            None => self.authority.clone(),
+            None => base.clone(),
         };
         let mut params = params.to_vec();
         params.push(("client_info", "1"));

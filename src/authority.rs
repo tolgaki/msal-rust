@@ -155,6 +155,69 @@ impl Authority {
         Ok(())
     }
 
+    /// Whether identities for this authority must be bound to a tenant ID that
+    /// only discovery can supply: an Entra or CIAM authority whose tenant is a
+    /// domain name (`contoso.onmicrosoft.com`) rather than a GUID or one of the
+    /// multi-tenant aliases.
+    pub(crate) fn needs_tenant_resolution(&self) -> bool {
+        matches!(
+            self.authority_type,
+            AuthorityType::Aad | AuthorityType::Ciam
+        ) && !matches!(
+            self.tenant.to_ascii_lowercase().as_str(),
+            "common" | "organizations" | "consumers"
+        ) && uuid::Uuid::parse_str(&self.tenant).is_err()
+    }
+
+    /// Return a copy of this authority whose `tenant` is the tenant GUID that
+    /// the authority's own v2.0 OpenID configuration names in its issuer.
+    ///
+    /// Endpoints are left unchanged. Tenant validation then compares account
+    /// and ID token tenants with this GUID, so tokens and cached identities
+    /// from another tenant are rejected for domain-name authorities too.
+    pub(crate) async fn resolve_tenant_id(&self, http: &reqwest::Client) -> Result<Self> {
+        let discovery_url = format!(
+            "{}/v2.0/.well-known/openid-configuration",
+            self.canonical_authority.as_str().trim_end_matches('/')
+        );
+        let unresolved = |detail: String| {
+            MsalError::AuthorityMetadataNotFound(format!(
+                "cannot resolve tenant ID for {}: {detail}",
+                self.canonical_authority
+            ))
+        };
+        let response = http.get(&discovery_url).send().await?;
+        if !response.status().is_success() {
+            return Err(unresolved(format!("HTTP {}", response.status())));
+        }
+        let config: OpenIdConfig = response.json().await?;
+        let issuer = Url::parse(&config.issuer)
+            .map_err(|_| unresolved("discovery issuer is not a URL".into()))?;
+        let mut segments = issuer
+            .path_segments()
+            .map(|segments| segments.filter(|segment| !segment.is_empty()))
+            .ok_or_else(|| unresolved("discovery issuer has no path".into()))?;
+        let tenant_id = match (segments.next(), segments.next(), segments.next()) {
+            (Some(tenant), Some("v2.0"), None) if uuid::Uuid::parse_str(tenant).is_ok() => {
+                tenant.to_ascii_lowercase()
+            }
+            _ => return Err(unresolved("discovery issuer names no tenant GUID".into())),
+        };
+        let authority_host = self.canonical_authority.host_str().unwrap_or_default();
+        let issuer_host = issuer.host_str().unwrap_or_default();
+        let host_matches = environments_equivalent(issuer_host, authority_host)
+            || (self.authority_type == AuthorityType::Ciam
+                && issuer_host.eq_ignore_ascii_case(&format!("{tenant_id}.ciamlogin.com")));
+        if issuer.scheme() != "https" || !host_matches {
+            return Err(unresolved(
+                "discovery issuer host differs from authority".into(),
+            ));
+        }
+        let mut resolved = self.clone();
+        resolved.tenant = tenant_id;
+        Ok(resolved)
+    }
+
     /// Whether `other` names this same authority, ignoring host case, known
     /// public-cloud host aliases, tenant case and a trailing slash.
     pub(crate) fn is_same_authority(&self, other: &str) -> Result<bool> {

@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OIDC scopes, accept domain-name tenant authorities, and the macOS adapter
   rejects responses without `expires_in`.
 
+- Domain-name tenant authorities (`https://login.microsoftonline.com/contoso.onmicrosoft.com`)
+  resolve their tenant GUID once per application from the authority's v2.0
+  OpenID configuration. Accounts, cached tokens (including imported snapshots),
+  ID tokens and broker results from any other tenant are rejected. Discovery
+  must succeed before the first identity check, so the first silent call needs
+  network access; GUID and `common`/`organizations`/`consumers` authorities
+  make no discovery request.
+
 ### Breaking
 
 - Server `interaction_required`, `consent_required`, `login_required` and

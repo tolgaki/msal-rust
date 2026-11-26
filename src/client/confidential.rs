@@ -148,10 +148,14 @@ impl ConfidentialClientApplication {
     ) -> Result<AuthenticationResult> {
         crate::request::validate_extra_query_parameters(&request.extra_query_parameters)?;
         crate::request::validate_claims(&request.claims)?;
-        crate::response::validate_account_authority(&request.account, &self.state.authority)?;
         if let Some(token) = &request.cancellation_token {
             token.check_cancelled()?;
         }
+        let authority = self
+            .state
+            .validation_authority(request.cancellation_token.as_ref())
+            .await?;
+        crate::response::validate_account_authority(&request.account, authority)?;
         let context =
             crate::cache::request_context(&request.claims, &request.extra_query_parameters);
         if !request.force_refresh {
