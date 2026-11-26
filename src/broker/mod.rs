@@ -97,7 +97,12 @@ pub struct BrokerTokenRequest {
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
     /// Native window handle for parenting the broker UI (interactive only).
-    /// On Windows this is an HWND. Pass `None` for console apps.
+    /// On Windows encode the HWND as `(hwnd as isize).to_le_bytes().to_vec()`,
+    /// with exactly the native pointer width (4 or 8 bytes); null/invalid HWNDs
+    /// are rejected. Keep the window alive until native completion.
+    /// `None` resolves `GetAncestor(GetConsoleWindow(), GA_ROOTOWNER)` for console
+    /// apps; if unavailable, supply an explicit HWND. No foreground/desktop fallback.
+    /// Silent WAM requests do not require a parent. macOS anchors are unsupported.
     pub window_handle: Option<Vec<u8>>,
     /// Token type: Bearer (default) or PoP.
     pub authentication_scheme: AuthenticationScheme,

@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         account: None,
         claims: None,
         correlation_id: None,
-        window_handle: None, // None for console apps; pass HWND bytes for GUI apps.
+        window_handle: None, // Console root owner; GUI: Some((hwnd as isize).to_le_bytes().to_vec()).
         authentication_scheme: AuthenticationScheme::Bearer,
         pop_params: None,
         force_refresh: false,

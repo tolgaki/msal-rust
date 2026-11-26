@@ -308,7 +308,7 @@ these Windows checks; do not treat an inferred endpoint pattern as verification.
 | Claims | Native `claims` property; exposed error metadata preserved | Separate `claims` option; OAuth/NSError challenge metadata preserved where exposed |
 | Extra parameters including `client_session` | Each validated key/value becomes a `WebTokenRequest.Properties` property | WWW-form-encoded map in `extra_query_param`, not invented top-level extension options |
 | Force refresh | `Unsupported` before dispatch: no verified raw-WAM bypass property | `force_refresh="1"` (or `"0"`) per native serializer; runtime-unverified here |
-| Selected account | `RequestTokenWithWebAccountAsync`, plus complete returned-identity checks | `home_account_id` plus complete returned-identity checks |
+| Selected account | Desktop `RequestTokenWithWebAccountForWindowAsync`, plus complete returned-identity checks | `home_account_id` plus complete returned-identity checks |
 | Cancellation token | `IAsyncInfo::Cancel`, then await terminal completion; cancellation failure surfaces, no UI-dismissal promise | Already cancelled: `OperationCancelled`; otherwise `Unsupported` before dispatch |
 | Enumeration/sign-out | `FindAllAccountsWithClientIdAsync` plus restored/verified associations; sign-out via `SignOutWithClientIdAsync` | Unentitled CLI: typed `get_accounts_operation`; entitled enumeration and client-only native sign-out: `Unsupported` |
 
@@ -354,7 +354,33 @@ successful acquisition and sign-out. Persist association deletion together with
 the consumer's own sign-out transaction; importing stale protected state does not
 undo native sign-out or prove a native account is still usable.
 
-Raw WAM force-refresh and explicit HWND parenting remain unsupported. Current
+WAM interactive acquisition uses
+[`IWebAuthenticationCoreManagerInterop`](https://learn.microsoft.com/en-us/windows/win32/api/webauthenticationcoremanagerinterop/nn-webauthenticationcoremanagerinterop-iwebauthenticationcoremanagerinterop)
+from the `WebAuthenticationCoreManager` activation factory. The no-account path
+calls `RequestTokenForWindowAsync`; selection calls
+`RequestTokenWithWebAccountForWindowAsync`. These desktop APIs avoid the UWP
+`RequestTokenAsync` CoreWindow requirement (`0x80073B27` on console threads).
+Silent acquisition and account enumeration retain their non-UI WinRT APIs;
+neither needs an HWND or a CoreWindow/UI thread.
+
+Encode a GUI parent as `Some((hwnd as isize).to_le_bytes().to_vec())` in
+`BrokerTokenRequest::window_handle` (for windows-rs `HWND`, use `hwnd.0 as isize`).
+The encoding is native pointer width: exactly 4 bytes for a 32-bit process, 8
+for a 64-bit process. Keep that window alive until native completion. Null,
+malformed and invalid handles are rejected, not silently replaced.
+`None` follows the
+[official MSAL.NET console/terminal helper](https://github.com/AzureAD/microsoft-authentication-library-for-dotnet/wiki/WAM/6a7a5afdb89cc328ef1575459629c982fa3f1bf0#parent-window-handles):
+`GetAncestor(GetConsoleWindow(), GA_ROOTOWNER)`, including the Windows Terminal
+pseudo-console case. If it returns no valid parent (for example, a headless
+process), acquisition fails with an actionable error; supply an explicit HWND.
+There is no foreground-window or desktop fallback. Availability of the broker
+alone does not prove a usable UI parent. Offline handle tests and Windows
+compilation do not prove live interactive authentication succeeds.
+Microsoft Learn currently lists Windows 10 build 20348 as the interop interface's
+minimum; availability on earlier builds is not runtime-verified here. Activation
+and native operation errors propagate rather than falling back to UWP dispatch.
+
+Raw WAM force-refresh remains unsupported. Current
 [MSAL.NET RuntimeBroker](https://github.com/AzureAD/microsoft-authentication-library-for-dotnet/blob/3d50649ef8551ea2f88a8426cc25cda84df8e5b2/src/client/Microsoft.Identity.Client.Broker/RuntimeBroker.cs)
 implements `ForceRefresh` by first obtaining an access token, setting native
 `AuthParameters.AccessTokenToRenew`, and acquiring again through MSALRuntime.
