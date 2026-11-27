@@ -7,12 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- WAM provider-denied/unsupported enumeration returns `Unsupported` rather than
+  an authentication failure. Provider failures remain errors; non-success
+  diagnostics include the actual status and available provider code/message.
+  Restored exact account lookup uses `FindAccountAsync` without enumeration.
+- Interactive WAM uses Win32 HWND interop for both generic and selected-account
+  requests, avoiding the UWP CoreWindow requirement on desktop/console threads
+  (`0x80073B27`). Explicit handles use native-width little-endian `isize` bytes.
+  Console defaults resolve the root owner via the official MSAL.NET helper;
+  no valid parent fails explicitly, without foreground/desktop substitution.
+- Device-code initiation omits `client_info=1`, which can cause Entra to reject
+  `/devicecode` requests with AADSTS700052 (`ProfileInfoToken`). Device polling,
+  refresh, authorization-code token exchanges and authorization URLs retain it.
+
 ### Changed
+
+- WAM exposes client/provider/authority-bound account-association snapshots for
+  the consumer's existing protected store. Cloned broker handles share mappings;
+  exact client/complete-identity lookup supports restored cold selection.
+  Enumeration returns the associated accounts and skips unassociated native
+  ones; export leaves out associations from another cloud.
+- WAM dispatches cooperative native cancellation and waits up to 5 seconds for
+  completion before returning `OperationCancelled`, without claiming UI
+  dismissal. Public silent acquisition forwards cancellation to capable
+  adapters and never returns or caches a result that raced cancellation. Raw-WAM force refresh remains explicitly unsupported;
+  MSALRuntime's access-token renewal API is not a raw-WAM property.
+- Unentitled macOS CLI brokers implement typed signed-in account enumeration
+  and complete-identity lookup; an identity reported under several environment
+  aliases is listed once. Entitled-app broker-key integration and isolated
+  native sign-out remain unsupported; shared-cache/device wiping is not used as
+  a shortcut. A runnable Tokio
+  worker/main-thread pump example documents lifecycle requirements; CI checks
+  compilation and offline tests, not installed extension runtime behavior.
 
 - All OAuth requests accept validated extra server parameters and cooperative
   cancellation. `client_session` is transmitted without claiming live server
   enforcement; claims and challenge metadata are preserved without silent retry.
-- Device/login requests obtain `client_info` and OIDC scopes. Refresh preserves
+- User login requests include OIDC scopes; authorization URLs and token
+  exchanges request `client_info`, not device-code initiation. Refresh preserves
   trusted prior identity when realistic responses omit ID tokens or rotation.
   Account, resource tenant, environment, audience, issuer and nonce mismatches
   fail explicitly instead of silently yielding incomplete cached identities.

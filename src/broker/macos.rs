@@ -61,9 +61,10 @@
 //!
 //! Construction checks extension availability on the main thread. This adapter
 //! maps claims, `force_refresh` and form-encoded `extra_query_param` using
-//! Microsoft's `MSIDBrokerOperationTokenRequest` protocol. Enumeration and
-//! sign-out currently return `Unsupported`: the extension has typed operations,
-//! but this adapter does not yet implement their identity/removal contracts.
+//! Microsoft's `MSIDBrokerOperationTokenRequest` protocol. CLI enumeration and
+//! lookup use typed operations. Sign-out lacks a verified client-only removal
+//! contract and remains unsupported. Entitled app account operations require
+//! a broker-key contract this adapter does not implement and return `Unsupported`.
 //! In-flight cancellation and explicit presentation anchors are also unsupported.
 
 use std::cell::RefCell;
@@ -86,6 +87,7 @@ use objc2_foundation::{
 };
 
 use crate::account::AccountInfo;
+use crate::broker::macos_protocol::{get_accounts_query, parse_accounts, GET_ACCOUNTS};
 use crate::broker::{
     account_from_native_response, same_account, validate_request, BrokerSignOutRequest,
     BrokerTokenRequest, NativeBroker,
@@ -113,6 +115,7 @@ pub struct MacOsBroker {
     available: bool,
     redirect_uri: String,
     authority: String,
+    unentitled_cli: bool,
 }
 
 impl MacOsBroker {
@@ -148,6 +151,7 @@ impl MacOsBroker {
             available,
             redirect_uri: redirect_uri.into(),
             authority,
+            unentitled_cli: false,
         })
     }
 
@@ -159,14 +163,17 @@ impl MacOsBroker {
     /// iOS/macOS platform with bundle ID `com.msauth.unsignedapp`.
     ///
     /// **Note**: Code-signed (but not `.app`-bundled) executables are currently
-    /// blocked by the broker. Ship the CLI unsigned or use ad-hoc signing only.
+    /// blocked by the broker. Use an unsigned, unentitled CLI. This constructor
+    /// does not bypass OS signing/entitlement checks.
     pub fn new_for_cli(authority: impl Into<String>) -> Result<Self> {
-        Self::new(CLI_REDIRECT_URI, authority)
+        let mut broker = Self::new(CLI_REDIRECT_URI, authority)?;
+        broker.unentitled_cli = true;
+        Ok(broker)
     }
 
     /// Execute an SSO request on the main thread, returning the result via oneshot.
-    async fn perform_request(&self, params: SsoRequestParams) -> Result<AuthenticationResult> {
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<AuthenticationResult>>();
+    async fn perform_request(&self, params: SsoRequestParams) -> Result<SsoResponse> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<SsoResponse>>();
 
         // All ObjC work happens on the main thread.
         dispatch2::DispatchQueue::main().exec_async(move || {
@@ -176,6 +183,75 @@ impl MacOsBroker {
         rx.await.map_err(|_| {
             MsalError::AuthenticationFailed("SSO broker delegate channel dropped".into())
         })?
+    }
+
+    /// Look up a complete identity in this client's signed-in native accounts.
+    /// Supported for unentitled CLI brokers; a home ID alone is ambiguous.
+    pub async fn account_for_client(
+        &self,
+        client_id: &str,
+        account: &AccountInfo,
+        correlation_id: &str,
+    ) -> Result<AccountInfo> {
+        crate::broker::validate_account_identity(account)?;
+        let matches = self.all_accounts(client_id, correlation_id).await?;
+        matches
+            .into_iter()
+            .find(|candidate| same_account(candidate, account))
+            .ok_or_else(|| {
+                MsalError::AuthenticationFailed(
+                    "SSO account not found for this client and identity".into(),
+                )
+            })
+    }
+
+    fn get_accounts_params(
+        &self,
+        client_id: &str,
+        correlation_id: &str,
+    ) -> Result<SsoRequestParams> {
+        if !self.unentitled_cli {
+            return Err(MsalError::Unsupported(
+                "typed SSO account operations require a broker key for entitled apps; \
+                 only the unentitled new_for_cli path is implemented"
+                    .into(),
+            ));
+        }
+        let params = SsoRequestParams {
+            client_id: client_id.into(),
+            redirect_uri: self.redirect_uri.clone(),
+            authority: self.authority.clone(),
+            scopes: String::new(),
+            operation: GET_ACCOUNTS.into(),
+            interactive: false,
+            account: None,
+            correlation_id: if correlation_id.is_empty() {
+                crate::crypto::generate_correlation_id()
+            } else {
+                correlation_id.into()
+            },
+            claims: None,
+            force_refresh: false,
+            extra_query_parameters: Default::default(),
+        };
+        params.query_parameters()?;
+        Ok(params)
+    }
+}
+
+enum SsoResponse {
+    Token(Box<AuthenticationResult>),
+    Accounts(Vec<AccountInfo>),
+}
+
+impl SsoResponse {
+    fn token(self) -> Result<AuthenticationResult> {
+        match self {
+            Self::Token(result) => Ok(*result),
+            _ => Err(MsalError::AuthenticationFailed(
+                "unexpected SSO token response".into(),
+            )),
+        }
     }
 }
 
@@ -271,6 +347,9 @@ impl SsoRequestParams {
             }
             query.insert("extra_query_param".into(), serializer.finish());
         }
+        if self.operation == GET_ACCOUNTS {
+            return get_accounts_query(&self.client_id, &self.correlation_id);
+        }
         Ok(query)
     }
 }
@@ -289,7 +368,7 @@ thread_local! {
 /// delegate, and starts the authorization controller.
 fn execute_sso_on_main_thread(
     params: SsoRequestParams,
-    tx: tokio::sync::oneshot::Sender<Result<AuthenticationResult>>,
+    tx: tokio::sync::oneshot::Sender<Result<SsoResponse>>,
 ) {
     let delegate = SsoDelegate::new(tx, params.clone());
     if let Err(error) = start_sso_on_main_thread(&params, &delegate) {
@@ -452,7 +531,7 @@ impl NativeBroker for MacOsBroker {
             };
 
             params.query_parameters()?;
-            self.perform_request(params).await
+            self.perform_request(params).await?.token()
         })
     }
 
@@ -489,7 +568,7 @@ impl NativeBroker for MacOsBroker {
             };
 
             params.query_parameters()?;
-            self.perform_request(params).await
+            self.perform_request(params).await?.token()
         })
     }
 
@@ -500,8 +579,9 @@ impl NativeBroker for MacOsBroker {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             Err(MsalError::Unsupported(
-                "this macOS adapter does not implement the typed signout_account_operation \
-                 contract; local cache removal is not native sign-out"
+                "SSO sign-out has no verified client-only native removal contract here; \
+                 wipe_account can remove shared SSO state and a non-wiping acknowledgement \
+                 does not prove removal. No native sign-out was dispatched"
                     .into(),
             ))
         })
@@ -509,15 +589,17 @@ impl NativeBroker for MacOsBroker {
 
     fn all_accounts<'a>(
         &'a self,
-        _client_id: &'a str,
-        _correlation_id: &'a str,
+        client_id: &'a str,
+        correlation_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AccountInfo>>> + Send + 'a>> {
         Box::pin(async move {
-            Err(MsalError::Unsupported(
-                "this macOS adapter does not implement typed get_accounts_operation responses; \
-                 it cannot report the native account list"
-                    .into(),
-            ))
+            let params = self.get_accounts_params(client_id, correlation_id)?;
+            match self.perform_request(params).await? {
+                SsoResponse::Accounts(accounts) => Ok(accounts),
+                _ => Err(MsalError::AuthenticationFailed(
+                    "unexpected SSO accounts response".into(),
+                )),
+            }
         })
     }
 
@@ -539,7 +621,7 @@ impl NativeBroker for MacOsBroker {
 // ── Delegate ────────────────────────────────────────────────────────────
 
 struct SsoDelegateIvars {
-    sender: Mutex<Option<tokio::sync::oneshot::Sender<Result<AuthenticationResult>>>>,
+    sender: Mutex<Option<tokio::sync::oneshot::Sender<Result<SsoResponse>>>>,
     request_id: String,
     params: SsoRequestParams,
 }
@@ -582,7 +664,7 @@ define_class!(
 
 impl SsoDelegate {
     fn new(
-        sender: tokio::sync::oneshot::Sender<Result<AuthenticationResult>>,
+        sender: tokio::sync::oneshot::Sender<Result<SsoResponse>>,
         params: SsoRequestParams,
     ) -> Retained<Self> {
         let mtm = MainThreadMarker::new().expect("SsoDelegate must be created on main thread");
@@ -594,7 +676,7 @@ impl SsoDelegate {
         unsafe { msg_send![super(this), init] }
     }
 
-    fn send_result(&self, result: Result<AuthenticationResult>) {
+    fn send_result(&self, result: Result<SsoResponse>) {
         // Keep the removed controller/delegate alive through this callback.
         let _retained =
             ACTIVE_REQUESTS.with(|requests| requests.borrow_mut().remove(&self.ivars().request_id));
@@ -609,7 +691,7 @@ impl SsoDelegate {
 fn parse_authorization(
     authorization: &ASAuthorization,
     params: &SsoRequestParams,
-) -> Result<AuthenticationResult> {
+) -> Result<SsoResponse> {
     let raw_credential = unsafe { authorization.credential() };
     let correct_type: bool = unsafe {
         msg_send![&*raw_credential, isKindOfClass: ASAuthorizationSingleSignOnCredential::class()]
@@ -646,7 +728,14 @@ fn parse_authorization(
         );
     }
 
-    parse_token_body(&serde_json::Value::Object(json_map), params)
+    let body = serde_json::Value::Object(json_map);
+    if let Some(error) = body["error"].as_str() {
+        return Err(oauth_error(error, &body, params));
+    }
+    match params.operation.as_str() {
+        GET_ACCOUNTS => Ok(SsoResponse::Accounts(parse_accounts(&body)?)),
+        _ => parse_token_body(&body, params).map(|result| SsoResponse::Token(Box::new(result))),
+    }
 }
 
 fn oauth_error(error: &str, body: &serde_json::Value, params: &SsoRequestParams) -> MsalError {
@@ -816,6 +905,37 @@ fn build_account_from_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn signout_rejects_unverified_shared_cache_removal_without_dispatch() {
+        let broker = MacOsBroker {
+            available: true,
+            redirect_uri: CLI_REDIRECT_URI.into(),
+            authority: MS_SSO_URL.into(),
+            unentitled_cli: true,
+        };
+        let account = AccountInfo {
+            home_account_id: "home-user.home-tenant".into(),
+            local_account_id: "guest-object".into(),
+            tenant_id: "resource-tenant".into(),
+            environment: crate::account::AAD_PUBLIC_CLOUD_ENVIRONMENT.into(),
+            username: String::new(),
+            name: None,
+            id_token_claims: None,
+        };
+        assert!(matches!(
+            broker
+                .sign_out(
+                    "client",
+                    &BrokerSignOutRequest {
+                        account,
+                        correlation_id: None,
+                    }
+                )
+                .await,
+            Err(MsalError::Unsupported(_))
+        ));
+    }
 
     fn params() -> SsoRequestParams {
         SsoRequestParams {

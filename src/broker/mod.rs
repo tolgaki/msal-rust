@@ -43,6 +43,9 @@ pub mod macos;
 #[cfg(all(target_os = "windows", feature = "broker-wam"))]
 pub mod wam;
 
+#[cfg(any(test, all(target_os = "macos", feature = "broker-macos")))]
+mod macos_protocol;
+
 use std::future::Future;
 use std::pin::Pin;
 
@@ -86,13 +89,20 @@ pub struct BrokerTokenRequest {
     pub authority: Option<String>,
     /// Additional server query parameters, mapped only through supported native APIs.
     pub extra_query_parameters: std::collections::BTreeMap<String, String>,
-    /// Cancellation of the native operation, not merely of the awaiting future.
-    /// Adapters without native cancellation reject an uncancelled token before dispatch.
+    /// Requests cancellation of the native operation, not merely the awaiting future.
+    /// WAM calls `IAsyncInfo::Cancel` and waits for native completion; this does
+    /// not guarantee UI dismissal or revoke already-issued tokens. Adapters
+    /// without native cancellation reject an uncancelled token before dispatch.
     pub cancellation_token: Option<crate::request::CancellationToken>,
     /// Correlation ID for request tracing.
     pub correlation_id: Option<String>,
     /// Native window handle for parenting the broker UI (interactive only).
-    /// On Windows this is an HWND. Pass `None` for console apps.
+    /// On Windows encode the HWND as `(hwnd as isize).to_le_bytes().to_vec()`,
+    /// with exactly the native pointer width (4 or 8 bytes); null/invalid HWNDs
+    /// are rejected. Keep the window alive until native completion.
+    /// `None` resolves `GetAncestor(GetConsoleWindow(), GA_ROOTOWNER)` for console
+    /// apps; if unavailable, supply an explicit HWND. No foreground/desktop fallback.
+    /// Silent WAM requests do not require a parent. macOS anchors are unsupported.
     pub window_handle: Option<Vec<u8>>,
     /// Token type: Bearer (default) or PoP.
     pub authentication_scheme: AuthenticationScheme,
@@ -124,6 +134,16 @@ pub struct BrokerSignOutRequest {
 pub trait NativeBroker: Send + Sync {
     /// Returns `true` if the broker is available on this platform.
     fn is_available(&self) -> bool;
+
+    /// Whether token acquisition accepts and dispatches native cancellation.
+    /// False preserves wait-only cancellation for legacy silent adapters.
+    /// True does not promise native UI dismissal or server-side rollback, but an
+    /// adapter returning true must still return promptly once cancellation is
+    /// requested (see `NATIVE_CANCEL_GRACE`), because callers do not add an
+    /// outer wait-only bound around it.
+    fn supports_native_cancellation(&self) -> bool {
+        false
+    }
 
     /// Acquire a token silently (no user prompts).
     ///
@@ -167,19 +187,75 @@ pub trait NativeBroker: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<AccountInfo>> + Send + 'a>>;
 }
 
+/// How long an adapter waits for a native operation to finish after asking it
+/// to cancel. Native cancellation is cooperative (an interactive prompt can stay
+/// open), so the caller gets `OperationCancelled` after this bound even if the
+/// native operation has not finished; its late result is never returned.
+#[cfg(any(test, all(target_os = "windows", feature = "broker-wam")))]
+pub(crate) const NATIVE_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Await a native operation, dispatching `cancel` when `cancellation` fires.
+///
+/// After cancelling, waits at most `grace` for the operation's terminal result,
+/// then returns `OperationCancelled`. A result racing cancellation is discarded.
+/// A failed `cancel` or an unexpected terminal native error is surfaced, but only
+/// after the bounded wait, so the operation is not abandoned mid-flight early.
+#[cfg(any(test, all(target_os = "windows", feature = "broker-wam")))]
+pub(crate) async fn await_with_cancellation<T>(
+    future: impl Future<Output = Result<T>>,
+    cancel: impl FnOnce() -> Result<()>,
+    cancellation: Option<&crate::request::CancellationToken>,
+    grace: std::time::Duration,
+) -> Result<T> {
+    use crate::error::MsalError;
+    tokio::pin!(future);
+    let Some(token) = cancellation else {
+        return future.await;
+    };
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => {}
+        result = &mut future => {
+            token.check_cancelled()?;
+            return result;
+        }
+    }
+    let cancel_result = cancel();
+    match tokio::time::timeout(grace, &mut future).await {
+        // Terminal native failure other than the cancellation we asked for.
+        Ok(Err(error)) if !matches!(error, MsalError::OperationCancelled) => {
+            cancel_result?;
+            Err(error)
+        }
+        // Completed (result discarded), cancelled, or still running after the
+        // grace period: the caller asked to cancel, so report that.
+        _ => {
+            cancel_result?;
+            Err(MsalError::OperationCancelled)
+        }
+    }
+}
+
 /// Shared preflight for adapters that cannot guarantee in-flight native cancellation.
+#[cfg(any(test, all(target_os = "macos", feature = "broker-macos")))]
+fn validate_request(request: &BrokerTokenRequest) -> Result<()> {
+    validate_request_options(request, false)
+}
+
 #[cfg(any(
     test,
     all(target_os = "windows", feature = "broker-wam"),
     all(target_os = "macos", feature = "broker-macos")
 ))]
-fn validate_request(request: &BrokerTokenRequest) -> Result<()> {
+fn validate_request_options(request: &BrokerTokenRequest, native_cancellation: bool) -> Result<()> {
     if let Some(token) = &request.cancellation_token {
         token.check_cancelled()?;
-        return Err(crate::error::MsalError::Unsupported(
-            "this native adapter cannot cancel an in-flight broker operation; omit cancellation_token"
-                .into(),
-        ));
+        if !native_cancellation {
+            return Err(crate::error::MsalError::Unsupported(
+                "this native adapter cannot cancel an in-flight broker operation; omit cancellation_token"
+                    .into(),
+            ));
+        }
     }
     crate::request::validate_extra_query_parameters(&request.extra_query_parameters)?;
     if request.authentication_scheme != AuthenticationScheme::Bearer || request.pop_params.is_some()
@@ -333,6 +409,127 @@ fn account_from_native_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GRACE: std::time::Duration = NATIVE_CANCEL_GRACE;
+
+    #[tokio::test]
+    async fn active_cancellation_dispatches_cancel_and_waits_for_terminal_result() {
+        let token = crate::request::CancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let future = async {
+            started_tx.send(()).unwrap();
+            terminal_rx.await.unwrap();
+            Ok(42)
+        };
+        let acquisition = await_with_cancellation(
+            future,
+            || {
+                cancel_tx.send(()).unwrap();
+                Ok(())
+            },
+            Some(&token),
+            GRACE,
+        );
+        tokio::pin!(acquisition);
+        tokio::select! {
+            biased;
+            result = &mut acquisition => panic!("completed before cancellation: {result:?}"),
+            _ = started_rx => {}
+        }
+        token.cancel();
+        tokio::select! {
+            biased;
+            result = &mut acquisition => panic!("returned without native completion: {result:?}"),
+            _ = cancel_rx => {}
+        }
+        terminal_tx.send(()).unwrap();
+        assert!(matches!(
+            acquisition.await,
+            Err(crate::error::MsalError::OperationCancelled)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_returns_after_grace_when_native_operation_never_finishes() {
+        let token = crate::request::CancellationToken::new();
+        token.cancel();
+        let started = tokio::time::Instant::now();
+        let result = await_with_cancellation(
+            std::future::pending::<Result<()>>(),
+            || Ok(()),
+            Some(&token),
+            GRACE,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(crate::error::MsalError::OperationCancelled)
+        ));
+        assert_eq!(started.elapsed(), GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_cancel_still_waits_for_the_operation_then_surfaces() {
+        let token = crate::request::CancellationToken::new();
+        token.cancel();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation = {
+            let finished = finished.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(42)
+            }
+        };
+        let result = await_with_cancellation(
+            operation,
+            || {
+                Err(crate::error::MsalError::AuthenticationFailed(
+                    "Cancel failed".into(),
+                ))
+            },
+            Some(&token),
+            GRACE,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(crate::error::MsalError::AuthenticationFailed(_))
+        ));
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancel_wins_ready_result_race_and_terminal_errors_surface() {
+        let token = crate::request::CancellationToken::new();
+        token.cancel();
+        assert!(matches!(
+            await_with_cancellation(async { Ok(42) }, || Ok(()), Some(&token), GRACE).await,
+            Err(crate::error::MsalError::OperationCancelled)
+        ));
+        assert!(matches!(
+            await_with_cancellation(
+                async {
+                    Err::<(), _>(crate::error::MsalError::AuthenticationFailed(
+                        "native".into(),
+                    ))
+                },
+                || Ok(()),
+                Some(&token),
+                GRACE
+            )
+            .await,
+            Err(crate::error::MsalError::AuthenticationFailed(_))
+        ));
+        assert_eq!(
+            await_with_cancellation(async { Ok(7) }, || Ok(()), None, GRACE)
+                .await
+                .unwrap(),
+            7
+        );
+    }
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
     fn native_account(claims: serde_json::Value) -> Result<AccountInfo> {

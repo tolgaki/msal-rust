@@ -219,11 +219,11 @@ fn extra_parameters_reject_oauth_override_and_allow_client_session() {
 }
 
 #[tokio::test]
-async fn device_initiation_and_polling_preserve_claims_session_and_client_info() {
+async fn device_flow_preserves_claims_session_and_requests_client_info_only_on_polling() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path(format!("/{TENANT}/oauth2/v2.0/devicecode")))
         .and(form_field("claims", CLAIMS)).and(form_field("client_session", "session"))
-        .and(form_field("client_info", "1"))
+        .and(|request: &Request| !url::form_urlencoded::parse(&request.body).any(|(key, _)| key == "client_info"))
         .and(|request: &Request| url::form_urlencoded::parse(&request.body).any(|(key, value)| key == "scope" && value.split_whitespace().any(|scope| scope == "openid")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "device_code":"device", "user_code":"ABCD", "verification_uri":"https://microsoft.com/devicelogin",
@@ -644,6 +644,7 @@ async fn code_exchange_checks_nonce_and_pkce() {
     Mock::given(method("POST"))
         .and(path(token_path()))
         .and(form_field("code_verifier", "verifier"))
+        .and(form_field("client_info", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(user_response(claims)))
         .expect(1)
         .mount(&server)
@@ -807,7 +808,7 @@ fn cache_treats_public_cloud_aliases_as_one_environment() {
         .is_some());
 }
 
-/// Broker double that, like the WAM and macOS adapters, rejects any request
+/// Legacy broker double that, like the macOS adapter, rejects any request
 /// carrying a cancellation token.
 struct StrictBroker;
 
@@ -917,6 +918,118 @@ async fn silent_broker_call_honors_cancellation_without_forwarding_it() {
         application.acquire_token_silent(silent).await,
         Err(MsalError::OperationCancelled)
     ));
+}
+
+struct CancellableBroker {
+    started: std::sync::Arc<tokio::sync::Notify>,
+    completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl msal::broker::NativeBroker for CancellableBroker {
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn supports_native_cancellation(&self) -> bool {
+        true
+    }
+
+    fn acquire_token_silent<'a>(
+        &'a self,
+        _client_id: &'a str,
+        request: &'a msal::broker::BrokerTokenRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = msal::error::Result<AuthenticationResult>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let token = request
+                .cancellation_token
+                .as_ref()
+                .expect("native token must be forwarded");
+            self.started.notify_one();
+            token.cancelled().await;
+            tokio::task::yield_now().await;
+            self.completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // A misbehaving adapter that completes successfully despite
+            // cancellation: the client must still report cancellation and
+            // must not cache the token.
+            let mut value = result(request.account.as_ref().unwrap());
+            value.access_token = "raced-cancellation".into();
+            value.refresh_token = None;
+            Ok(value)
+        })
+    }
+
+    fn acquire_token_interactive<'a>(
+        &'a self,
+        client_id: &'a str,
+        request: &'a msal::broker::BrokerTokenRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = msal::error::Result<AuthenticationResult>> + Send + 'a,
+        >,
+    > {
+        StrictBroker.acquire_token_interactive(client_id, request)
+    }
+
+    fn sign_out<'a>(
+        &'a self,
+        client_id: &'a str,
+        request: &'a msal::broker::BrokerSignOutRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = msal::error::Result<()>> + Send + 'a>>
+    {
+        StrictBroker.sign_out(client_id, request)
+    }
+
+    fn all_accounts<'a>(
+        &'a self,
+        client_id: &'a str,
+        correlation_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = msal::error::Result<Vec<AccountInfo>>> + Send + 'a>,
+    > {
+        StrictBroker.all_accounts(client_id, correlation_id)
+    }
+
+    fn account<'a>(
+        &'a self,
+        account_id: &'a str,
+        correlation_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = msal::error::Result<AccountInfo>> + Send + 'a>,
+    > {
+        StrictBroker.account(account_id, correlation_id)
+    }
+}
+
+#[tokio::test]
+async fn native_silent_cancellation_is_forwarded_and_adapter_is_not_dropped() {
+    let application = brokered_app().await;
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    application
+        .set_broker(Box::new(CancellableBroker {
+            started: started.clone(),
+            completed: completed.clone(),
+        }))
+        .await;
+    let token = CancellationToken::new();
+    let mut silent = SilentFlowRequest::new(
+        vec!["user.read".into()],
+        account("login.microsoftonline.com"),
+    );
+    silent.cancellation_token = Some(token.clone());
+    let cancel = async {
+        started.notified().await;
+        token.cancel();
+    };
+    let (result, _) = tokio::join!(application.acquire_token_silent(silent), cancel);
+    assert!(matches!(result, Err(MsalError::OperationCancelled)));
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    let cached = serde_json::to_value(application.export_cache().unwrap()).unwrap();
+    assert_eq!(cached["tokens"], serde_json::json!([]));
 }
 
 #[tokio::test]
