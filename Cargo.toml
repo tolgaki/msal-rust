@@ -73,6 +73,10 @@ windows = { version = "0.62", optional = true, features = [
     "Foundation_Collections",
     "Security_Authentication_Web_Core",
     "Security_Credentials",
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_WinRT",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 windows-future = { version = "0.3", optional = true }
 

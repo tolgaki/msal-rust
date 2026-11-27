@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Interactive WAM uses Win32 HWND interop for both generic and selected-account
+  requests, avoiding the UWP CoreWindow requirement on desktop/console threads
+  (`0x80073B27`). Explicit handles use native-width little-endian `isize` bytes.
+  Console defaults resolve the root owner via the official MSAL.NET helper;
+  no valid parent fails explicitly, without foreground/desktop substitution.
 - Device-code initiation omits `client_info=1`, which can cause Entra to reject
   `/devicecode` requests with AADSTS700052 (`ProfileInfoToken`). Device polling,
   refresh, authorization-code token exchanges and authorization URLs retain it.

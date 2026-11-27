@@ -1,13 +1,16 @@
 //! Windows Web Account Manager (WAM) broker implementation.
 //!
-//! Requires Windows 10 1703+ and the registered redirect URI
+//! Provider APIs require Windows 10 1703+ and the registered redirect URI
 //! `ms-appx-web://Microsoft.AAD.BrokerPlugin/{client_id}`.
+//! Microsoft documents desktop interop from build 20348; earlier interop
+//! availability is not runtime-verified here, and native activation errors propagate.
 //!
 //! This is the raw AAD WAM provider, not MSALRuntime. Its compatibility
 //! properties follow Microsoft's MSAL.NET 4.30.1 `AadPlugin`/`WamAdapters`.
 //! Force-refresh fails before dispatch; MSALRuntime's AccessTokenToRenew is
 //! not a raw-WAM property. Cancellation calls IAsyncInfo::Cancel and waits for
-//! native completion, without guaranteeing UI dismissal. HWND interop is absent.
+//! native completion, without guaranteeing UI dismissal. Interactive requests use
+//! HWND desktop interop, not CoreWindow-dependent UWP request APIs.
 //!
 //! WAM account IDs are opaque and must not be treated as MSAL home IDs.
 //! Verified associations can be exported/imported using the caller's protected store.
@@ -27,6 +30,10 @@ use windows::Security::Authentication::Web::Core::{
     WebTokenRequestPromptType, WebTokenRequestResult, WebTokenRequestStatus, WebTokenResponse,
 };
 use windows::Security::Credentials::{WebAccount, WebAccountProvider};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Console::GetConsoleWindow;
+use windows::Win32::System::WinRT::IWebAuthenticationCoreManagerInterop;
+use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, IsWindow, GA_ROOTOWNER};
 use windows_future::{AsyncStatus, IAsyncOperation};
 
 use crate::account::AccountInfo;
@@ -599,6 +606,87 @@ fn validate_authority(authority: &str) -> Result<()> {
     Ok(())
 }
 
+fn decode_window_handle(bytes: &[u8]) -> Result<isize> {
+    let bytes = bytes.try_into().map_err(|_| {
+        MsalError::InvalidConfiguration(format!(
+            "WAM window_handle must contain exactly {} little-endian bytes (isize)",
+            std::mem::size_of::<isize>(),
+        ))
+    })?;
+    let handle = isize::from_le_bytes(bytes);
+    if handle == 0 {
+        return Err(MsalError::InvalidConfiguration(
+            "WAM window_handle must not be null".into(),
+        ));
+    }
+    Ok(handle)
+}
+
+fn resolve_window_handle(
+    bytes: Option<&[u8]>,
+    console_window: impl FnOnce() -> isize,
+    root_owner: impl FnOnce(isize) -> isize,
+    is_window: impl FnOnce(isize) -> bool,
+) -> Result<isize> {
+    let handle = if let Some(bytes) = bytes {
+        decode_window_handle(bytes)?
+    } else {
+        let console = console_window();
+        if console == 0 {
+            return Err(MsalError::MissingParameter(
+                "WAM needs window_handle: this process has no console window".into(),
+            ));
+        }
+        root_owner(console)
+    };
+    if handle == 0 || !is_window(handle) {
+        return Err(MsalError::InvalidConfiguration(
+            "WAM needs a valid parent window_handle; no valid console/terminal root owner was found or the supplied HWND is invalid".into(),
+        ));
+    }
+    Ok(handle)
+}
+
+fn interactive_window_handle(bytes: Option<&[u8]>) -> Result<isize> {
+    resolve_window_handle(
+        bytes,
+        || unsafe { GetConsoleWindow().0 as isize },
+        |console| unsafe { GetAncestor(HWND(console as *mut _), GA_ROOTOWNER).0 as isize },
+        |handle| unsafe { IsWindow(Some(HWND(handle as *mut _))).as_bool() },
+    )
+}
+
+fn request_token_for_window(
+    handle: isize,
+    request: &WebTokenRequest,
+    account: Option<&WebAccount>,
+) -> Result<IAsyncOperation<WebTokenRequestResult>> {
+    let window = HWND(handle as *mut _);
+    // Account lookup can yield before dispatch; the caller must keep its window
+    // alive, but reject a window already destroyed during that wait.
+    if !unsafe { IsWindow(Some(window)).as_bool() } {
+        return Err(MsalError::InvalidConfiguration(
+            "WAM parent HWND is no longer a valid window".into(),
+        ));
+    }
+    let interop = windows::core::factory::<
+        WebAuthenticationCoreManager,
+        IWebAuthenticationCoreManagerInterop,
+    >()
+    .map_err(native_error)?;
+    // The projection supplies the IID of IAsyncOperation<WebTokenRequestResult>.
+    // Windows owns the HWND; request/account are live WinRT references.
+    unsafe {
+        match account {
+            Some(account) => {
+                interop.RequestTokenWithWebAccountForWindowAsync(window, request, account)
+            }
+            None => interop.RequestTokenForWindowAsync(window, request),
+        }
+    }
+    .map_err(native_error)
+}
+
 fn request_properties(
     request: &BrokerTokenRequest,
     default_authority: &str,
@@ -609,10 +697,8 @@ fn request_properties(
             "raw WAM has no verified force-refresh contract; MSALRuntime is required".into(),
         ));
     }
-    if request.window_handle.is_some() {
-        return Err(MsalError::Unsupported(
-            "WAM desktop HWND interop is not implemented".into(),
-        ));
+    if let Some(bytes) = &request.window_handle {
+        decode_window_handle(bytes)?;
     }
     let authority = request.authority.as_deref().unwrap_or(default_authority);
     validate_authority(authority)?;
@@ -736,6 +822,7 @@ impl NativeBroker for WamBroker {
     ) -> Pin<Box<dyn Future<Output = Result<AuthenticationResult>> + Send + 'a>> {
         Box::pin(async move {
             let wam_request = self.build_token_request(client_id, request)?;
+            let handle = interactive_window_handle(request.window_handle.as_deref())?;
             let operation = if let Some(account) = &request.account {
                 let web_account = self
                     .find_account(client_id, account, request.cancellation_token.as_ref())
@@ -743,14 +830,10 @@ impl NativeBroker for WamBroker {
                 if let Some(token) = &request.cancellation_token {
                     token.check_cancelled()?;
                 }
-                WebAuthenticationCoreManager::RequestTokenWithWebAccountAsync(
-                    &wam_request,
-                    &web_account,
-                )
+                request_token_for_window(handle, &wam_request, Some(&web_account))
             } else {
-                WebAuthenticationCoreManager::RequestTokenAsync(&wam_request)
-            }
-            .map_err(native_error)?;
+                request_token_for_window(handle, &wam_request, None)
+            }?;
             let result = await_operation(operation, request.cancellation_token.as_ref()).await?;
             self.handle_result(client_id, request, &result)
         })
@@ -834,6 +917,86 @@ impl NativeBroker for WamBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hwnd_encoding_preserves_native_pointer_bits_and_rejects_bad_inputs() {
+        for handle in [1isize, 0x123456, isize::MAX, isize::MIN] {
+            assert_eq!(decode_window_handle(&handle.to_le_bytes()).unwrap(), handle);
+        }
+        for bytes in [
+            Vec::new(),
+            vec![1; std::mem::size_of::<isize>() - 1],
+            vec![1; std::mem::size_of::<isize>() + 1],
+            0isize.to_le_bytes().to_vec(),
+        ] {
+            assert!(matches!(
+                decode_window_handle(&bytes),
+                Err(MsalError::InvalidConfiguration(_))
+            ));
+        }
+        let handle = 0x123456isize;
+        let mut request = request();
+        request.window_handle = Some(handle.to_le_bytes().to_vec());
+        assert!(request_properties(&request, DEFAULT_AUTHORITY).is_ok());
+        request.window_handle = Some(vec![1]);
+        assert!(request_properties(&request, DEFAULT_AUTHORITY).is_err());
+    }
+
+    #[test]
+    fn explicit_hwnd_takes_priority_and_never_falls_back() {
+        let bytes = 42isize.to_le_bytes();
+        assert_eq!(
+            resolve_window_handle(
+                Some(&bytes),
+                || panic!("must not infer a console"),
+                |_| panic!("must not replace the caller's HWND"),
+                |handle| handle == 42,
+            )
+            .unwrap(),
+            42
+        );
+        assert!(matches!(
+            resolve_window_handle(
+                Some(&bytes),
+                || panic!("invalid explicit HWND must not fall back"),
+                |_| panic!("invalid explicit HWND must not fall back"),
+                |_| false,
+            ),
+            Err(MsalError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn console_resolution_uses_root_owner_and_errors_without_a_usable_parent() {
+        assert_eq!(
+            resolve_window_handle(
+                None,
+                || 10,
+                |console| {
+                    assert_eq!(console, 10);
+                    20
+                },
+                |root| root == 20
+            )
+            .unwrap(),
+            20
+        );
+        assert!(matches!(
+            resolve_window_handle(
+                None,
+                || 0,
+                |_| panic!("no console must not be passed to GetAncestor"),
+                |_| panic!("must not choose an unrelated window"),
+            ),
+            Err(MsalError::MissingParameter(_))
+        ));
+        for root in [0, 20] {
+            assert!(matches!(
+                resolve_window_handle(None, || 10, |_| root, |_| false),
+                Err(MsalError::InvalidConfiguration(_))
+            ));
+        }
+    }
 
     fn request() -> BrokerTokenRequest {
         BrokerTokenRequest {
