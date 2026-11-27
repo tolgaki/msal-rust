@@ -348,6 +348,21 @@ than rewriting it. Acquisition still requires the matching explicit authority
 override when the default authority names another tenant. Lookup checks native existence;
 subsequent token responses still check the complete selected identity.
 
+WAM enumeration can be unavailable even after interactive sign-in succeeds.
+[`FindAllWebAccountsStatus`](https://learn.microsoft.com/en-us/uwp/api/windows.security.authentication.web.core.findallwebaccountsstatus)
+`NotAllowedByProvider` (application not permitted to enumerate) and
+`NotSupportedByProvider` return `MsalError::Unsupported`, not an authentication
+failure or a claimed successful empty list. Consumers may treat those capability
+errors as no enumerable accounts. `ProviderError` and unknown statuses remain
+`AuthenticationFailed`. Non-success errors include the symbolic/numeric status
+and provider code/message when available; failures to read optional diagnostics
+are included too. `FindAllAccountsResult` has no separate `ErrorStatus` property;
+failed native async operations retain their HRESULT through the native error.
+`account_for_client` uses the snapshot-associated native ID with `FindAccountAsync`
+directly. It does **not** call or require enumeration, so restored exact lookup
+can be attempted when enumeration is disallowed. Its own native failures still
+propagate; enumeration permission does not establish exact-lookup success.
+
 The snapshot contains identity metadata, not tokens. It is not encrypted and
 structural validation is **not authentication of imported state**. Use the
 consumer's existing protected store with integrity and client/authority binding;

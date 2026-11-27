@@ -111,6 +111,8 @@ impl WamBroker {
 
     /// Look up an exact client-bound identity and verify its WAM account exists.
     /// A home ID alone is insufficient for guest/resource-tenant selection.
+    /// Uses the associated native ID with `FindAccountAsync`, not enumeration;
+    /// provider permission to enumerate accounts is not required.
     pub async fn account_for_client(
         &self,
         client_id: &str,
@@ -505,6 +507,31 @@ fn native_error(error: windows::core::Error) -> MsalError {
     MsalError::AuthenticationFailed(format!("WAM native error: {error}"))
 }
 
+fn check_enumeration_status(
+    status: FindAllWebAccountsStatus,
+    provider_diagnostics: impl FnOnce() -> String,
+) -> Result<()> {
+    let name = match status {
+        FindAllWebAccountsStatus::Success => return Ok(()),
+        FindAllWebAccountsStatus::NotAllowedByProvider => "NotAllowedByProvider",
+        FindAllWebAccountsStatus::NotSupportedByProvider => "NotSupportedByProvider",
+        FindAllWebAccountsStatus::ProviderError => "ProviderError",
+        _ => "Unknown",
+    };
+    let description = format!(
+        "WAM account enumeration status={name} ({}); {}",
+        status.0,
+        provider_diagnostics(),
+    );
+    if status == FindAllWebAccountsStatus::NotAllowedByProvider
+        || status == FindAllWebAccountsStatus::NotSupportedByProvider
+    {
+        Err(MsalError::Unsupported(description))
+    } else {
+        Err(MsalError::AuthenticationFailed(description))
+    }
+}
+
 fn validate_client_id(client_id: &str) -> Result<()> {
     if client_id.trim().is_empty() {
         return Err(MsalError::InvalidConfiguration(
@@ -874,11 +901,24 @@ impl NativeBroker for WamBroker {
             .map_err(native_error)?
             .await
             .map_err(native_error)?;
-            if result.Status().map_err(native_error)? != FindAllWebAccountsStatus::Success {
-                return Err(MsalError::AuthenticationFailed(
-                    "WAM account enumeration failed".into(),
-                ));
-            }
+            check_enumeration_status(result.Status().map_err(native_error)?, || {
+                match result.ProviderError() {
+                    Ok(error) => {
+                        let code = match error.ErrorCode() {
+                            Ok(code) => format!("{code} (0x{code:08X})"),
+                            Err(error) => format!("unavailable: {error}"),
+                        };
+                        let message = match error.ErrorMessage() {
+                            Ok(message) => message.to_string(),
+                            Err(error) => format!("unavailable: {error}"),
+                        };
+                        format!(
+                            "ProviderError.ErrorCode={code}; ProviderError.ErrorMessage={message}"
+                        )
+                    }
+                    Err(error) => format!("ProviderError unavailable: {error}"),
+                }
+            })?;
             let native_accounts = result.Accounts().map_err(native_error)?;
             let mut native_ids = Vec::new();
             for i in 0..native_accounts.Size().map_err(native_error)? {
@@ -917,6 +957,58 @@ impl NativeBroker for WamBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_enumeration_does_not_require_provider_error_metadata() {
+        assert!(
+            check_enumeration_status(FindAllWebAccountsStatus::Success, || {
+                panic!("success must not read optional error metadata")
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn provider_denied_or_unsupported_enumeration_is_distinct_from_auth_failure() {
+        for (status, name) in [
+            (
+                FindAllWebAccountsStatus::NotAllowedByProvider,
+                "NotAllowedByProvider (1)",
+            ),
+            (
+                FindAllWebAccountsStatus::NotSupportedByProvider,
+                "NotSupportedByProvider (2)",
+            ),
+        ] {
+            let error = check_enumeration_status(status, || {
+                "ProviderError unavailable: null native error".into()
+            })
+            .unwrap_err();
+            let MsalError::Unsupported(description) = error else {
+                panic!("enumeration capability must not be an authentication failure");
+            };
+            assert!(description.contains(name));
+            assert!(description.contains("ProviderError unavailable: null native error"));
+        }
+    }
+
+    #[test]
+    fn provider_failures_and_unknown_enumeration_status_preserve_diagnostics() {
+        for (status, name) in [
+            (FindAllWebAccountsStatus::ProviderError, "ProviderError (3)"),
+            (FindAllWebAccountsStatus(99), "Unknown (99)"),
+        ] {
+            let error = check_enumeration_status(status, || {
+                "ProviderError.ErrorCode=2147942405 (0x80070005); ProviderError.ErrorMessage=access denied".into()
+            }).unwrap_err();
+            let MsalError::AuthenticationFailed(description) = error else {
+                panic!("provider failures must not be treated as an empty list or Unsupported");
+            };
+            assert!(description.contains(name));
+            assert!(description.contains("2147942405 (0x80070005)"));
+            assert!(description.contains("access denied"));
+        }
+    }
 
     #[test]
     fn hwnd_encoding_preserves_native_pointer_bits_and_rejects_bad_inputs() {

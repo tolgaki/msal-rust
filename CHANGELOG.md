@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- WAM provider-denied/unsupported enumeration returns `Unsupported` rather than
+  an authentication failure. Provider failures remain errors; non-success
+  diagnostics include the actual status and available provider code/message.
+  Restored exact account lookup uses `FindAccountAsync` without enumeration.
 - Interactive WAM uses Win32 HWND interop for both generic and selected-account
   requests, avoiding the UWP CoreWindow requirement on desktop/console threads
   (`0x80073B27`). Explicit handles use native-width little-endian `isize` bytes.
