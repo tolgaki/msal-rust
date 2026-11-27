@@ -952,7 +952,13 @@ impl msal::broker::NativeBroker for CancellableBroker {
             tokio::task::yield_now().await;
             self.completed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            Err(MsalError::OperationCancelled)
+            // A misbehaving adapter that completes successfully despite
+            // cancellation: the client must still report cancellation and
+            // must not cache the token.
+            let mut value = result(request.account.as_ref().unwrap());
+            value.access_token = "raced-cancellation".into();
+            value.refresh_token = None;
+            Ok(value)
         })
     }
 
@@ -1022,7 +1028,8 @@ async fn native_silent_cancellation_is_forwarded_and_adapter_is_not_dropped() {
     let (result, _) = tokio::join!(application.acquire_token_silent(silent), cancel);
     assert!(matches!(result, Err(MsalError::OperationCancelled)));
     assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(application.all_accounts().await.unwrap().is_empty());
+    let cached = serde_json::to_value(application.export_cache().unwrap()).unwrap();
+    assert_eq!(cached["tokens"], serde_json::json!([]));
 }
 
 #[tokio::test]

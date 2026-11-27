@@ -18,16 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - WAM exposes client/provider/authority-bound account-association snapshots for
   the consumer's existing protected store. Cloned broker handles share mappings;
   exact client/complete-identity lookup supports restored cold selection.
-- WAM dispatches cooperative native cancellation and awaits completion, without
-  claiming UI dismissal. Public silent acquisition forwards cancellation to
-  capable adapters. Raw-WAM force refresh remains explicitly unsupported;
+  Enumeration returns the associated accounts and skips unassociated native
+  ones; export leaves out associations from another cloud.
+- WAM dispatches cooperative native cancellation and waits up to 5 seconds for
+  completion before returning `OperationCancelled`, without claiming UI
+  dismissal. Public silent acquisition forwards cancellation to capable
+  adapters and never returns or caches a result that raced cancellation. Raw-WAM force refresh remains explicitly unsupported;
   MSALRuntime's access-token renewal API is not a raw-WAM property.
 - Unentitled macOS CLI brokers implement typed signed-in account enumeration
-  and complete-identity lookup. Entitled-app broker-key integration and isolated
+  and complete-identity lookup; an identity reported under several environment
+  aliases is listed once. Entitled-app broker-key integration and isolated
   native sign-out remain unsupported; shared-cache/device wiping is not used as
   a shortcut. A runnable Tokio
-  worker/main-thread pump example documents lifecycle requirements; installed
-  extension/runtime behavior has not been verified on Windows.
+  worker/main-thread pump example documents lifecycle requirements; CI checks
+  compilation and offline tests, not installed extension runtime behavior.
 
 - All OAuth requests accept validated extra server parameters and cooperative
   cancellation. `client_session` is transmitted without claiming live server

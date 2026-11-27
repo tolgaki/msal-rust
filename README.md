@@ -309,15 +309,18 @@ these Windows checks; do not treat an inferred endpoint pattern as verification.
 | Extra parameters including `client_session` | Each validated key/value becomes a `WebTokenRequest.Properties` property | WWW-form-encoded map in `extra_query_param`, not invented top-level extension options |
 | Force refresh | `Unsupported` before dispatch: no verified raw-WAM bypass property | `force_refresh="1"` (or `"0"`) per native serializer; runtime-unverified here |
 | Selected account | `RequestTokenWithWebAccountAsync`, plus complete returned-identity checks | `home_account_id` plus complete returned-identity checks |
-| Cancellation token | `IAsyncInfo::Cancel`, then await terminal completion; cancellation failure surfaces, no UI-dismissal promise | Already cancelled: `OperationCancelled`; otherwise `Unsupported` before dispatch |
-| Enumeration/sign-out | `FindAllAccountsWithClientIdAsync` plus restored/verified associations; sign-out via `SignOutWithClientIdAsync` | Unentitled CLI: typed `get_accounts_operation`; entitled enumeration and client-only native sign-out: `Unsupported` |
+| Cancellation token | `IAsyncInfo::Cancel`, then wait up to 5s for terminal completion before returning `OperationCancelled`; cancellation failure surfaces, no UI-dismissal promise | Already cancelled: `OperationCancelled`; otherwise `Unsupported` before dispatch |
+| Enumeration/sign-out | `FindAllAccountsWithClientIdAsync`, returning only accounts with restored/verified associations; sign-out via `SignOutWithClientIdAsync` | Unentitled CLI: typed `get_accounts_operation`; entitled enumeration and client-only native sign-out: `Unsupported` |
 
 WAM associations map complete identity to the opaque native account ID **in this
 broker and client only**, shared by `WamBroker::clone()`. They are established
 by a successfully identity-validated native response or restored from trusted,
-integrity-protected consumer state. Cold selected-account/silent requests or
-enumerations containing an unassociated account fail closed; a username, home
-tenant or opaque WAM ID is not used to guess the missing resource identity.
+integrity-protected consumer state. Cold selected-account/silent requests for an
+unassociated account fail closed, and enumeration skips native accounts without
+an association instead of failing for all of them; a username, home tenant or
+opaque WAM ID is not used to guess the missing resource identity. Export leaves
+out associations whose environment is not in the broker authority's cloud,
+since they cannot be restored under that binding.
 `NativeBroker::account(home_id)` is unsupported because a home ID alone cannot
 select client/resource-tenant context. Restoring OAuth cache snapshots does not
 restore these native associations automatically.
@@ -367,9 +370,12 @@ port therefore rejects raw-WAM force refresh rather than inventing a property.
 returns true. Public silent acquisition forwards cancellation to capable native
 adapters and does not drop their futures at an outer wait-only cancellation
 boundary. Legacy silent adapters retain wait-only cancellation. WAM cancels the
-account lookup/token `IAsyncOperation`, retains it until completion and discards
-a result racing cancellation. A failed `Cancel` or unexpected terminal native
-error is surfaced. [WinRT cancellation is cooperative](https://learn.microsoft.com/en-us/windows/uwp/threading-async/cancel-an-async-operation):
+account lookup/token `IAsyncOperation`, waits up to 5 seconds for it to finish,
+then returns `OperationCancelled` even if it has not (an interactive prompt can
+stay open), and never returns a result racing cancellation. A failed `Cancel` or
+an unexpected terminal native error is surfaced after that bounded wait. A
+capable adapter must return promptly once cancellation is requested, because the
+public client adds no outer bound; it also rechecks the token before caching. [WinRT cancellation is cooperative](https://learn.microsoft.com/en-us/windows/uwp/threading-async/cancel-an-async-operation):
 neither a successful call nor `OperationCancelled` proves UI dismissal, server
 rollback or token revocation. Dropping an acquisition future without using its
 cancellation token does not promise native cancellation.
@@ -419,11 +425,12 @@ cargo run --example broker_macos_cli --features broker-macos
 
 It constructs the broker on main, moves acquisition to a Tokio runtime on a
 worker thread and pumps main until that worker completes. No token is printed.
-The main-loop polling deadline is not an auth timeout. Both
-`x86_64-apple-darwin` and `aarch64-apple-darwin` checks were attempted on Windows
-(the missing Intel standard-library target was installed); both stop in `ring`
-because this host lacks a Darwin C compiler/SDK. Offline portable Apple
-account-protocol tests are not macOS adapter compilation or runtime verification.
+The main-loop polling deadline is not an auth timeout. CI runs
+`cargo test --features broker-macos` on macOS and checks both
+`x86_64-apple-darwin` and `aarch64-apple-darwin`. That verifies compilation and
+offline protocol tests, not the installed SSO extension's runtime behavior.
+Signed-in enumeration lists an identity once even when the extension reports it
+under several environment aliases.
 No live authentication, keychain, device-registration or tenant mutation was
 performed to test these changes.
 

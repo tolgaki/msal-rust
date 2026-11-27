@@ -84,11 +84,11 @@ pub(super) fn parse_accounts(body: &serde_json::Value) -> Result<Vec<AccountInfo
                 ));
             }
         }
-        if accounts.insert(account.cache_key(), account).is_some() {
-            return Err(MsalError::AuthenticationFailed(
-                "duplicate SSO account identity".into(),
-            ));
-        }
+        // The native cache can hold one identity under several environment
+        // aliases (login.windows.net, login.microsoftonline.com). After
+        // canonicalization these are the same complete identity: keep the first
+        // instead of failing the whole enumeration.
+        accounts.entry(account.cache_key()).or_insert(account);
     }
     Ok(accounts.into_values().collect())
 }
@@ -146,6 +146,34 @@ mod tests {
         let mut body = response();
         body["accounts"] = "[]".into();
         assert!(parse_accounts(&body).unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_identity_under_environment_aliases_is_listed_once() {
+        let mut body = response();
+        body["accounts"] = serde_json::json!([
+            {
+                "home_account_id": "home-user.home-tenant", "local_account_id": "guest-object",
+                "realm": "resource-tenant", "environment": "login.windows.net",
+                "username": "first"
+            },
+            {
+                "home_account_id": "home-user.home-tenant", "local_account_id": "guest-object",
+                "realm": "resource-tenant", "environment": "login.microsoftonline.com",
+                "username": "second"
+            },
+            {
+                "home_account_id": "home-user.home-tenant", "local_account_id": "home-object",
+                "realm": "home-tenant", "environment": "login.microsoftonline.com"
+            }
+        ])
+        .to_string()
+        .into();
+        let accounts = parse_accounts(&body).unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts
+            .iter()
+            .any(|account| account.same_identity(&guest())));
     }
 
     #[test]

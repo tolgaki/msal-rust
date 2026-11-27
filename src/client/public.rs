@@ -208,6 +208,11 @@ impl PublicClientApplication {
                         Err(MsalError::Unsupported(_)) => {}
                         outcome => {
                             let result = outcome?;
+                            // An adapter must discard a result racing cancellation;
+                            // never return or cache one if it did not.
+                            if let Some(token) = &request.cancellation_token {
+                                token.check_cancelled()?;
+                            }
                             self.validate_broker_result(
                                 authority,
                                 &result,

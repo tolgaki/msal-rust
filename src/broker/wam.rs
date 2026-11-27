@@ -80,24 +80,7 @@ impl WamBroker {
             .accounts
             .lock()
             .map_err(|_| MsalError::AuthenticationFailed("WAM account map poisoned".into()))?;
-        let mut accounts: Vec<_> = known
-            .iter()
-            .filter(|((client, _), _)| client == client_id)
-            .map(|(_, (id, account))| WamAccountAssociation {
-                native_account_id: id.clone(),
-                account: account.clone(),
-            })
-            .collect();
-        accounts.sort_by_key(|entry| entry.account.cache_key());
-        let snapshot = WamAccountSnapshot {
-            version: 1,
-            client_id: client_id.into(),
-            authority: self.authority.clone(),
-            provider_id: AAD_PROVIDER_ID.into(),
-            accounts,
-        };
-        validate_snapshot(client_id, &self.authority, snapshot.clone())?;
-        Ok(snapshot)
+        snapshot_for_client(&known, client_id, &self.authority)
     }
 
     /// Atomically replace this client's associations from integrity-protected data.
@@ -398,6 +381,63 @@ fn mapped_account_id(
         })
 }
 
+/// Build and validate this client's export from the shared association map.
+fn snapshot_for_client(
+    known: &AccountAssociations,
+    client_id: &str,
+    authority: &str,
+) -> Result<WamAccountSnapshot> {
+    let authority_host = url::Url::parse(authority)
+        .ok()
+        .and_then(|url| url.host_str().map(String::from))
+        .unwrap_or_default();
+    // Accounts acquired through an authority in another cloud cannot be
+    // restored under this broker's authority binding; leave them out rather
+    // than making every later export fail.
+    let mut accounts: Vec<_> = known
+        .iter()
+        .filter(|((client, _), (_, account))| {
+            client == client_id
+                && crate::authority::environments_equivalent(&authority_host, &account.environment)
+        })
+        .map(|(_, (id, account))| WamAccountAssociation {
+            native_account_id: id.clone(),
+            account: account.clone(),
+        })
+        .collect();
+    accounts.sort_by_key(|entry| entry.account.cache_key());
+    let snapshot = WamAccountSnapshot {
+        version: 1,
+        client_id: client_id.into(),
+        authority: authority.into(),
+        provider_id: AAD_PROVIDER_ID.into(),
+        accounts,
+    };
+    validate_snapshot(client_id, authority, snapshot.clone())?;
+    Ok(snapshot)
+}
+
+/// Verified identities for the native accounts WAM reports for this client.
+///
+/// Native accounts without a verified association are skipped, not guessed:
+/// raw WAM metadata cannot establish a guest-safe home/resource identity, and
+/// one unrelated or unrestored OS account must not hide the verified ones.
+fn associated_accounts(
+    accounts: &AccountAssociations,
+    client_id: &str,
+    native_ids: &[String],
+) -> Vec<AccountInfo> {
+    let mut found: Vec<AccountInfo> = accounts
+        .iter()
+        .filter(|((client, _), (native_id, _))| {
+            client == client_id && native_ids.iter().any(|id| id == native_id)
+        })
+        .map(|(_, (_, account))| account.clone())
+        .collect();
+    found.sort_by_key(AccountInfo::cache_key);
+    found
+}
+
 fn account_after_native_lookup(
     accounts: &AccountAssociations,
     client_id: &str,
@@ -531,37 +571,13 @@ async fn await_operation<T: RuntimeType + 'static>(
             }
         })
     };
-    await_with_cancellation(
+    crate::broker::await_with_cancellation(
         future,
         || operation.Cancel().map_err(native_error),
         cancellation,
+        crate::broker::NATIVE_CANCEL_GRACE,
     )
     .await
-}
-
-async fn await_with_cancellation<T>(
-    future: impl Future<Output = Result<T>>,
-    cancel: impl FnOnce() -> Result<()>,
-    cancellation: Option<&crate::request::CancellationToken>,
-) -> Result<T> {
-    tokio::pin!(future);
-    if let Some(token) = cancellation {
-        tokio::select! {
-            biased;
-            _ = token.cancelled() => {
-                cancel()?;
-                // Cancel is cooperative. Keep waiting until native completion,
-                // and never parse/cache a result racing application cancellation.
-                future.await?;
-                return Err(MsalError::OperationCancelled);
-            }
-            result = &mut future => {
-                token.check_cancelled()?;
-                return result;
-            }
-        }
-    }
-    future.await
 }
 
 fn validate_authority(authority: &str) -> Result<()> {
@@ -781,32 +797,22 @@ impl NativeBroker for WamBroker {
                 ));
             }
             let native_accounts = result.Accounts().map_err(native_error)?;
+            let mut native_ids = Vec::new();
+            for i in 0..native_accounts.Size().map_err(native_error)? {
+                native_ids.push(
+                    native_accounts
+                        .GetAt(i)
+                        .map_err(native_error)?
+                        .Id()
+                        .map_err(native_error)?
+                        .to_string(),
+                );
+            }
             let known = self
                 .accounts
                 .lock()
                 .map_err(|_| MsalError::AuthenticationFailed("WAM account map poisoned".into()))?;
-            let mut accounts = Vec::new();
-            for i in 0..native_accounts.Size().map_err(native_error)? {
-                let id = native_accounts
-                    .GetAt(i)
-                    .map_err(native_error)?
-                    .Id()
-                    .map_err(native_error)?
-                    .to_string();
-                let matches: Vec<_> = known
-                    .iter()
-                    .filter(|((client, _), (native_id, _))| client == client_id && native_id == &id)
-                    .map(|(_, (_, account))| account.clone())
-                    .collect();
-                if matches.is_empty() {
-                    return Err(MsalError::Unsupported(
-                        "raw WAM account metadata cannot establish guest-safe home/resource identity \
-                         without a verified token response; no token acquisition was attempted".into(),
-                    ));
-                }
-                accounts.extend(matches);
-            }
-            Ok(accounts)
+            Ok(associated_accounts(&known, client_id, &native_ids))
         })
     }
 
@@ -1060,61 +1066,35 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn active_cancellation_dispatches_cancel_and_waits_for_terminal_result() {
-        let token = crate::request::CancellationToken::new();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
-        let future = async {
-            started_tx.send(()).unwrap();
-            terminal_rx.await.unwrap();
-            Ok(42)
-        };
-        let acquisition = await_with_cancellation(
-            future,
-            || {
-                cancel_tx.send(()).unwrap();
-                Ok(())
-            },
-            Some(&token),
-        );
-        tokio::pin!(acquisition);
-        tokio::select! {
-            biased;
-            result = &mut acquisition => panic!("completed before cancellation: {result:?}"),
-            _ = started_rx => {}
-        }
-        token.cancel();
-        tokio::select! {
-            biased;
-            result = &mut acquisition => panic!("returned without native completion: {result:?}"),
-            _ = cancel_rx => {}
-        }
-        terminal_tx.send(()).unwrap();
-        assert!(matches!(
-            acquisition.await,
-            Err(MsalError::OperationCancelled)
-        ));
+    #[test]
+    fn enumeration_skips_unassociated_native_accounts() {
+        let snapshot = snapshot();
+        let account = snapshot.accounts[0].account.clone();
+        let known = validate_snapshot("client", DEFAULT_AUTHORITY, snapshot).unwrap();
+        let native_ids = vec![
+            "unrelated-os-account".to_string(),
+            "opaque-native-id".into(),
+        ];
+        let accounts = associated_accounts(&known, "client", &native_ids);
+        assert_eq!(accounts.len(), 1);
+        assert!(same_account(&accounts[0], &account));
+        assert!(associated_accounts(&known, "other-client", &native_ids).is_empty());
+        assert!(associated_accounts(&known, "client", &["unrelated-os-account".into()]).is_empty());
     }
 
-    #[tokio::test]
-    async fn cancellation_failure_surfaces_and_cancel_wins_ready_result_race() {
-        let token = crate::request::CancellationToken::new();
-        token.cancel();
-        assert!(matches!(
-            await_with_cancellation(
-                async { Ok(42) },
-                || { Err(MsalError::AuthenticationFailed("Cancel failed".into())) },
-                Some(&token)
-            )
-            .await,
-            Err(MsalError::AuthenticationFailed(_))
-        ));
-        assert!(matches!(
-            await_with_cancellation(async { Ok(42) }, || Ok(()), Some(&token)).await,
-            Err(MsalError::OperationCancelled)
-        ));
+    #[test]
+    fn export_leaves_out_accounts_from_another_cloud() {
+        let snapshot = snapshot();
+        let mut known = validate_snapshot("client", DEFAULT_AUTHORITY, snapshot).unwrap();
+        let mut sovereign = known.values().next().unwrap().1.clone();
+        sovereign.environment = "login.microsoftonline.us".into();
+        known.insert(
+            ("client".into(), sovereign.cache_key()),
+            ("us-native-id".into(), sovereign),
+        );
+        let exported = snapshot_for_client(&known, "client", DEFAULT_AUTHORITY).unwrap();
+        assert_eq!(exported.accounts.len(), 1);
+        assert_eq!(exported.accounts[0].native_account_id, "opaque-native-id");
     }
 
     #[test]
